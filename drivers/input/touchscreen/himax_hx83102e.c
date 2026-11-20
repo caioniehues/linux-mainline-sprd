@@ -108,7 +108,7 @@ module_param(debug, uint, 0644);
 MODULE_PARM_DESC(debug, "Debug log mask (bit 0: bus and firmware steps, bit 1: touch frames)");
 
 static char *firmware_name;
-module_param(firmware_name, charp, 0644);
+module_param(firmware_name, charp, 0444);
 MODULE_PARM_DESC(firmware_name, "Unused: the device tree firmware-name, or the built-in default, always wins");
 
 static unsigned int init_delay_ms = 1000;
@@ -167,7 +167,8 @@ struct hx83102e {
 	struct touchscreen_properties prop;
 	u32 max_points;
 	int irq;
-	bool irq_enabled;
+	bool irq_enabled;		/* guarded by irq_lock */
+	spinlock_t irq_lock;
 	struct delayed_work init_work;
 	struct delayed_work poll_work;
 	u32 poll_ms;			/* module parameter snapshot, fixed at probe */
@@ -525,6 +526,20 @@ static void hx_report_frame(struct hx83102e *hx, const u8 *f)
 	input_sync(input);
 }
 
+/* Enable or disable the IRQ once; callable from the IRQ thread (never waits). */
+static void hx_irq_set(struct hx83102e *hx, bool enable)
+{
+	spin_lock_irq(&hx->irq_lock);
+	if (hx->irq_enabled != enable) {
+		hx->irq_enabled = enable;
+		if (enable)
+			enable_irq(hx->irq);
+		else
+			disable_irq_nosync(hx->irq);
+	}
+	spin_unlock_irq(&hx->irq_lock);
+}
+
 /* Read one event frame and report it; after too many failures ask for a re-init. */
 static void hx_read_frame(struct hx83102e *hx, bool clear_errors)
 {
@@ -545,6 +560,9 @@ static void hx_read_frame(struct hx83102e *hx, bool clear_errors)
 		dev_err(&hx->spi->dev, "too many bus errors, reinitialising\n");
 		hx->bus_errors = 0;
 		hx->ready = false;
+		/* Keep a level-triggered line quiet until init_work re-enables it. */
+		if (hx->irq > 0)
+			hx_irq_set(hx, false);
 		schedule_delayed_work(&hx->init_work, 0);
 	}
 }
@@ -950,10 +968,8 @@ static void hx_init_work(struct work_struct *work)
 	hx->init_attempts = 0;
 	hx->ready = true;
 	if (!hx->poll_ms) {
-		if (hx->irq > 0 && !hx->irq_enabled) {
-			enable_irq(hx->irq);
-			hx->irq_enabled = true;
-		}
+		if (hx->irq > 0)
+			hx_irq_set(hx, true);
 	} else {
 		schedule_delayed_work(&hx->poll_work, 0);
 	}
@@ -965,10 +981,8 @@ out_unlock:
 	return;
 
 err:
-	if (hx->irq > 0 && hx->irq_enabled) {
-		disable_irq(hx->irq);
-		hx->irq_enabled = false;
-	}
+	if (hx->irq > 0)
+		hx_irq_set(hx, false);
 fail:
 	retry = hx->init_attempts++ < init_retries;
 	attempts = hx->init_attempts;
@@ -988,9 +1002,9 @@ static void hx_stop(struct hx83102e *hx)
 	bool was_ready = hx->ready;
 
 	hx->ready = false;
-	if (hx->irq > 0 && hx->irq_enabled) {
-		disable_irq(hx->irq);
-		hx->irq_enabled = false;
+	if (hx->irq > 0) {
+		hx_irq_set(hx, false);
+		synchronize_irq(hx->irq);
 	}
 	cancel_delayed_work_sync(&hx->poll_work);
 
@@ -1118,6 +1132,7 @@ static int hx_probe(struct spi_device *spi)
 	hx->max_points = HX_MAX_POINTS;
 	mutex_init(&hx->lock);
 	mutex_init(&hx->state_lock);
+	spin_lock_init(&hx->irq_lock);
 	INIT_DELAYED_WORK(&hx->init_work, hx_init_work);
 	INIT_DELAYED_WORK(&hx->poll_work, hx_poll_work);
 	spi_set_drvdata(spi, hx);
