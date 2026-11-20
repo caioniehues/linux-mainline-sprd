@@ -99,6 +99,8 @@
 #define HX_FW_DESC_TAG		0x87
 #define HX_FW_TABLE_COUNT_OFF	0x0c
 
+#define HX_CFG_MAX		SZ_1M	/* sanity cap on the config area */
+
 #define HX_CRC_POLY		0x82f63b78
 
 static unsigned int debug;
@@ -118,7 +120,7 @@ module_param(init_retries, uint, 0644);
 MODULE_PARM_DESC(init_retries, "How many times a failed initialisation is retried, 2 s apart");
 
 static unsigned int poll_ms;
-module_param(poll_ms, uint, 0644);
+module_param(poll_ms, uint, 0444);
 MODULE_PARM_DESC(poll_ms, "Poll the controller every this many ms instead of using the interrupt (0: interrupt)");
 
 static bool skip_firmware;
@@ -168,6 +170,7 @@ struct hx83102e {
 	bool irq_enabled;
 	struct delayed_work init_work;
 	struct delayed_work poll_work;
+	u32 poll_ms;			/* module parameter snapshot, fixed at probe */
 	u32 init_attempts;
 	u32 bus_errors;
 	bool ready;
@@ -563,7 +566,7 @@ static void hx_poll_work(struct work_struct *work)
 		return;
 
 	hx_read_frame(hx, false);
-	schedule_delayed_work(&hx->poll_work, msecs_to_jiffies(poll_ms));
+	schedule_delayed_work(&hx->poll_work, msecs_to_jiffies(hx->poll_ms));
 }
 
 /* Locate the config table in the firmware image and fill hx->parts[]. */
@@ -572,6 +575,7 @@ static int hx_parse_firmware(struct hx83102e *hx)
 	struct device *dev = &hx->spi->dev;
 	const struct firmware *fw = hx->fw;
 	u32 off, limit, table = 0, count, i, min_sram, max_sram, max_idx;
+	u64 cfg_size;
 	bool found = false;
 
 	if (fw->size < 0x10)
@@ -647,7 +651,19 @@ no_table:
 	}
 
 	hx->cfg_sram = min_sram & ~3U;
-	hx->cfg_size = ALIGN(max_sram + hx->parts[max_idx].size - hx->cfg_sram, 16);
+	cfg_size = ALIGN((u64)max_sram + hx->parts[max_idx].size - hx->cfg_sram, 16);
+	if (cfg_size > HX_CFG_MAX) {
+		dev_err(dev, "config area of %llu bytes is too large\n", cfg_size);
+		return -EINVAL;
+	}
+	/* Not checked by the original; keeps the copies below inside cfg_buf. */
+	for (i = 1; i < count; i++) {
+		if ((u64)hx->parts[i].sram - hx->cfg_sram + hx->parts[i].size > cfg_size) {
+			dev_err(dev, "partition %u does not fit the config area\n", i);
+			return -EINVAL;
+		}
+	}
+	hx->cfg_size = cfg_size;
 	hx->cfg_buf = devm_kzalloc(dev, hx->cfg_size, GFP_KERNEL);
 	if (!hx->cfg_buf)
 		return -ENOMEM;
@@ -689,7 +705,7 @@ static int hx_power_on(struct hx83102e *hx)
 		ret = regulator_enable(hx->vsp);
 		if (ret) {
 			dev_err(dev, "vsp enable failed: %d\n", ret);
-			return ret;
+			goto off_vccd;
 		}
 		usleep_range(1000, 2000);
 	}
@@ -697,12 +713,33 @@ static int hx_power_on(struct hx83102e *hx)
 		ret = regulator_enable(hx->vsn);
 		if (ret) {
 			dev_err(dev, "vsn enable failed: %d\n", ret);
-			return ret;
+			goto off_vsp;
 		}
 		usleep_range(1000, 2000);
 	}
 	hx->powered = true;
 	return 0;
+
+off_vsp:
+	if (hx->vsp)
+		regulator_disable(hx->vsp);
+off_vccd:
+	if (hx->vccd)
+		regulator_disable(hx->vccd);
+	return ret;
+}
+
+static void hx_power_off(struct hx83102e *hx)
+{
+	if (!hx->powered)
+		return;
+	hx->powered = false;
+	if (hx->vsn)
+		regulator_disable(hx->vsn);
+	if (hx->vsp)
+		regulator_disable(hx->vsp);
+	if (hx->vccd)
+		regulator_disable(hx->vccd);
 }
 
 /* Identify the chip; returns 0, a bus error or -ENODEV. */
@@ -846,11 +883,12 @@ static void hx_init_work(struct work_struct *work)
 {
 	struct hx83102e *hx = container_of(work, struct hx83102e, init_work.work);
 	struct device *dev = &hx->spi->dev;
-	u32 val = 0;
+	u32 val = 0, attempts;
+	bool retry;
 	int ret;
 
 	mutex_lock(&hx->state_lock);
-	if (hx->ready)
+	if (hx->ready || hx->suspended)
 		goto out_unlock;
 
 	if (!hx->powered) {
@@ -909,8 +947,9 @@ static void hx_init_work(struct work_struct *work)
 		goto err;
 
 	hx->bus_errors = 0;
+	hx->init_attempts = 0;
 	hx->ready = true;
-	if (!poll_ms) {
+	if (!hx->poll_ms) {
 		if (hx->irq > 0 && !hx->irq_enabled) {
 			enable_irq(hx->irq);
 			hx->irq_enabled = true;
@@ -919,7 +958,7 @@ static void hx_init_work(struct work_struct *work)
 		schedule_delayed_work(&hx->poll_work, 0);
 	}
 	dev_info(dev, "touch ready: %u points, %ux%u, %s\n", hx->max_points,
-		 hx->prop.max_x + 1, hx->prop.max_y + 1, poll_ms ? "polling" : "interrupt");
+		 hx->prop.max_x + 1, hx->prop.max_y + 1, hx->poll_ms ? "polling" : "interrupt");
 
 out_unlock:
 	mutex_unlock(&hx->state_lock);
@@ -931,29 +970,36 @@ err:
 		hx->irq_enabled = false;
 	}
 fail:
+	retry = hx->init_attempts++ < init_retries;
+	attempts = hx->init_attempts;
 	mutex_unlock(&hx->state_lock);
-	if (hx->init_attempts++ < init_retries) {
+	if (retry) {
 		dev_info(dev, "init failed (%d), retry %u/%u in 2 s\n", ret,
-			 hx->init_attempts, init_retries);
+			 attempts, init_retries);
 		schedule_delayed_work(&hx->init_work, 2 * HZ);
 	} else {
-		dev_err(dev, "giving up after %u attempts\n", hx->init_attempts);
+		dev_err(dev, "giving up after %u attempts\n", attempts);
 	}
 }
 
 /* The caller holds state_lock. */
 static void hx_stop(struct hx83102e *hx)
 {
-	if (!hx->ready)
-		return;
+	bool was_ready = hx->ready;
 
 	hx->ready = false;
-	if (!poll_ms && hx->irq > 0 && hx->irq_enabled) {
+	if (hx->irq > 0 && hx->irq_enabled) {
 		disable_irq(hx->irq);
 		hx->irq_enabled = false;
 	}
 	cancel_delayed_work_sync(&hx->poll_work);
-	if (hx_sense_off(hx))
+
+	/* Lift any finger still down; no frame will come to do it. */
+	input_mt_sync_frame(hx->input);
+	input_mt_report_pointer_emulation(hx->input, true);
+	input_sync(hx->input);
+
+	if (was_ready && hx_sense_off(hx))
 		dev_warn(&hx->spi->dev, "sense-off on stop failed\n");
 }
 
@@ -974,6 +1020,7 @@ static int hx_resume(struct device *dev)
 
 	mutex_lock(&hx->state_lock);
 	hx->suspended = false;
+	hx->init_attempts = 0;
 	mutex_unlock(&hx->state_lock);
 	schedule_delayed_work(&hx->init_work, 0);
 	return 0;
@@ -1025,25 +1072,18 @@ static void hx_remove(struct spi_device *spi)
 {
 	struct hx83102e *hx = spi_get_drvdata(spi);
 
-	cancel_delayed_work_sync(&hx->init_work);
-	cancel_delayed_work_sync(&hx->poll_work);
+	/* Stop first: the IRQ and poll paths can queue init_work until they are quiet. */
 	mutex_lock(&hx->state_lock);
+	hx->suspended = true;
 	hx_stop(hx);
 	mutex_unlock(&hx->state_lock);
+	cancel_delayed_work_sync(&hx->init_work);
 
 	if (hx->fw) {
 		release_firmware(hx->fw);
 		hx->fw = NULL;
 	}
-	if (hx->powered) {
-		hx->powered = false;
-		if (hx->vsn)
-			regulator_disable(hx->vsn);
-		if (hx->vsp)
-			regulator_disable(hx->vsp);
-		if (hx->vccd)
-			regulator_disable(hx->vccd);
-	}
+	hx_power_off(hx);
 }
 
 static struct regulator *hx_get_supply(struct device *dev, const char *id,
@@ -1161,27 +1201,29 @@ static int hx_probe(struct spi_device *spi)
 	}
 
 	hx->irq = spi->irq;
-	if (!poll_ms) {
+	hx->poll_ms = poll_ms;
+	if (!hx->poll_ms) {
 		if (hx->irq < 1) {
 			dev_warn(dev, "no interrupt, polling every 10 ms\n");
-			poll_ms = 10;
+			hx->poll_ms = 10;
 		} else {
 			/*
-			 * As in the binary: the line stays enabled after the
-			 * request while irq_enabled is false, so the first
-			 * init enable_irq() is unbalanced (it warns once).
+			 * Deliberate deviation from the binary, which leaves the
+			 * line enabled so its first init enable_irq() is
+			 * unbalanced: start disabled, init_work enables it.
 			 */
 			ret = devm_request_threaded_irq(dev, hx->irq, NULL, hx_irq_thread,
-							IRQF_ONESHOT, "himax_hx83102e", hx);
+							IRQF_ONESHOT | IRQF_NO_AUTOEN,
+							"himax_hx83102e", hx);
 			if (ret) {
 				dev_err(dev, "cannot request irq %d: %d, polling instead\n",
 					hx->irq, ret);
-				poll_ms = 10;
+				hx->poll_ms = 10;
 				hx->irq = 0;
 			}
 		}
 	} else {
-		dev_info(dev, "polling every %u ms\n", poll_ms);
+		dev_info(dev, "polling every %u ms\n", hx->poll_ms);
 	}
 
 	dev_info(dev, "Himax HX83102E: SPI bus %d cs %u mode 0x%x %u Hz irq %d fw %s\n",
