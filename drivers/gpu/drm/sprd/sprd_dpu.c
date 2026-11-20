@@ -460,6 +460,18 @@ static void sprd_dpu_init(struct sprd_dpu *dpu)
 	u32 int_mask = 0;
 	u32 dpu_version;
 
+	/*
+	 * On sharkl5pro the DPU core clock is not selected by the CLK_DISPC0
+	 * mux but by the AP DVFS block: a table of operating points and one
+	 * work index for the display. The index resets to 0 (153.6 MHz). A
+	 * pixel clock above that (166 MHz on the Galaxy Tab A8) drains the
+	 * DPI FIFO on the first active line of every frame: an underflow per
+	 * frame and no picture. Select the board's operating point before the
+	 * DPU runs. The vendor kernel does this in its dpu-dvfs driver.
+	 */
+	if (ctx->dvfs_syscon)
+		regmap_write(ctx->dvfs_syscon, ctx->dvfs_offset, ctx->dvfs_index);
+
 	/* clear the bootloader's pinned state so our config can latch */
 	sprd_dpu_reset(ctx);
 
@@ -970,6 +982,24 @@ static int sprd_dpu_context_init(struct sprd_dpu *dpu,
 		} else {
 			ctx->rst_offset = args[0];
 			ctx->rst_mask = args[1];
+		}
+	}
+
+	/*
+	 * Optional: the AP DVFS work index for the DPU core clock.
+	 * sprd,dvfs-syscon = <&ap_dvfs offset index>.
+	 */
+	{
+		u32 args[2];
+
+		ctx->dvfs_syscon = syscon_regmap_lookup_by_phandle_args(dev->of_node,
+									"sprd,dvfs-syscon",
+									2, args);
+		if (IS_ERR(ctx->dvfs_syscon)) {
+			ctx->dvfs_syscon = NULL;
+		} else {
+			ctx->dvfs_offset = args[0];
+			ctx->dvfs_index = args[1];
 		}
 	}
 

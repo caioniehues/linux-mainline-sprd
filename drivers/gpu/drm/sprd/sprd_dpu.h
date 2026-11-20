@@ -57,6 +57,9 @@ struct dpu_context {
 	struct regmap *rst_syscon;
 	u32 rst_offset;
 	u32 rst_mask;
+	struct regmap *dvfs_syscon;
+	u32 dvfs_offset;
+	u32 dvfs_index;
 };
 
 /**
