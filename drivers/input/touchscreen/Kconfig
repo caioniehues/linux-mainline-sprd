@@ -1425,4 +1425,17 @@ config TOUCHSCREEN_HIMAX_HX83112B
 	  To compile this driver as a module, choose M here: the
 	  module will be called himax_hx83112b.
 
+config TOUCHSCREEN_HIMAX_HX83102E
+	tristate "Himax hx83102e SPI touchscreen driver"
+	depends on SPI
+	help
+	  Say Y here to enable support for Himax hx83102e touchscreens
+	  connected over SPI. The controller has no flash: the driver
+	  loads its firmware from the file named by the device tree.
+
+	  If unsure, say N.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called himax_hx83102e.
+
 endif
