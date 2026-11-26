@@ -117,6 +117,36 @@ static const u32 layer_fmts[] = {
 	DRM_FORMAT_YVU420,
 };
 
+static bool dpi_halt = true;
+module_param(dpi_halt, bool, 0644);
+MODULE_PARM_DESC(dpi_halt, "Enable DPU DPI halt handshake on DPU >= r3p0");
+
+static unsigned int dpi_clk_khz;
+module_param(dpi_clk_khz, uint, 0644);
+MODULE_PARM_DESC(dpi_clk_khz, "Override DPI pixel clock in kHz when setting rate (0 = mode clock)");
+
+static bool dpi_clk_set_rate;
+module_param(dpi_clk_set_rate, bool, 0644);
+MODULE_PARM_DESC(dpi_clk_set_rate, "Force clk_set_rate on dpi clock even when sprd,dpi-clk-div is set");
+
+static int __init sprd_dpu_dpi_halt_setup(char *s)
+{
+	return kstrtobool(s, &dpi_halt) == 0;
+}
+__setup("sprd_dpu.dpi_halt=", sprd_dpu_dpi_halt_setup);
+
+static int __init sprd_dpu_dpi_clk_khz_setup(char *s)
+{
+	return kstrtouint(s, 0, &dpi_clk_khz) == 0;
+}
+__setup("sprd_dpu.dpi_clk_khz=", sprd_dpu_dpi_clk_khz_setup);
+
+static int __init sprd_dpu_dpi_clk_set_rate_setup(char *s)
+{
+	return kstrtobool(s, &dpi_clk_set_rate) == 0;
+}
+__setup("sprd_dpu.dpi_clk_set_rate=", sprd_dpu_dpi_clk_set_rate_setup);
+
 struct sprd_plane {
 	struct drm_plane base;
 };
@@ -488,6 +518,10 @@ static void sprd_dpu_init(struct sprd_dpu *dpu)
 
 	writel(0x00, ctx->base + REG_BG_COLOR);
 
+	if (ctx->qos_syscon)
+		regmap_update_bits(ctx->qos_syscon, ctx->qos_offset,
+				   ctx->qos_mask, ctx->qos_val);
+
 	/*
 	 * DDR QoS (CFG1) and CFG2. Without the QoS priorities the DPU's DDR
 	 * read requests starve and the layer FIFO underflows on the first
@@ -508,28 +542,10 @@ static void sprd_dpu_init(struct sprd_dpu *dpu)
 			/* select te from external pad */
 			dpu_reg_set(ctx, REG_DPI_CTRL, BIT_DPU_EDPI_FROM_EXTERNAL_PAD);
 		} else {
-			/*
-			 * Keep BIT_DPU_DPI_HALT_EN CLEARED (free-running DPI), NOT
-			 * set. The vendor BSP sets it so the DPU's DPI output gates
-			 * on the DSI ready/ack handshake, and an earlier session
-			 * re-enabled it on the theory that the flags=3 burst fix
-			 * (lanes now streaming, PHY_STATUS=0x1f02) had finally made
-			 * the handshake completable.
-			 *
-			 * The two captured dmesg logs (2026-06-26,
-			 * good-fbcon-dmesg.log vs bad-fbcon-dmesg.log) disprove that:
-			 *  - The only state that ever lights the panel (U-Boot
-			 *    handoff, fbcon visible) has DPI_CTRL=0x00000000 AND
-			 *    DSI_MODE_CFG=0x0 -- both halt halves OFF, DPU free-runs.
-			 *  - The black kernel-native state had DPI_CTRL=0x00010000
-			 *    (this HALT_EN bit) AND DSI_MODE_CFG=0x2. Both halves on,
-			 *    lanes park in stopstate (PHY_STATUS=0x1f32), no scanout.
-			 * Enabling the halt handshake has produced a black panel on
-			 * every measurement; free-running is the only proven-good
-			 * config. Pair this with DSI_MODE_CFG=0 in sprd_dsi.c
-			 * (sprd_dsi_set_work_mode). See DISPLAY-KNOWN-GOOD-DSI-STATE.md.
-			 */
-			dpu_reg_clr(ctx, REG_DPI_CTRL, BIT_DPU_DPI_HALT_EN);
+			if (dpi_halt)
+				dpu_reg_set(ctx, REG_DPI_CTRL, BIT_DPU_DPI_HALT_EN);
+			else
+				dpu_reg_clr(ctx, REG_DPI_CTRL, BIT_DPU_DPI_HALT_EN);
 		}
 
 		/* enable dpu update done INT */
@@ -617,6 +633,40 @@ void sprd_dpu_stop(struct sprd_dpu *dpu)
 		dpu_reg_set(ctx, REG_DPU_CTRL, BIT_DPU_STOP);
 
 	dpu_wait_stop_done(dpu);
+}
+
+void sprd_dpu_halt(struct sprd_dpu *dpu)
+{
+	struct dpu_context *ctx = &dpu->ctx;
+
+	writel(0x00, ctx->base + REG_DPU_INT_EN);
+	writel(0xff, ctx->base + REG_DPU_INT_CLR);
+
+	if (ctx->rst_syscon) {
+		sprd_dpu_reset(ctx);
+	} else {
+		dpu_reg_set(ctx, REG_DPU_CTRL, BIT_DPU_STOP);
+		ctx->stopped = true;
+	}
+
+	drm_info(dpu->drm, "dpu halted: CTRL=0x%08x INT_EN=0x%08x DPI_CTRL=0x%08x\n",
+		 readl(ctx->base + REG_DPU_CTRL),
+		 readl(ctx->base + REG_DPU_INT_EN),
+		 readl(ctx->base + REG_DPI_CTRL));
+}
+
+void sprd_dpu_dump_state(struct sprd_dpu *dpu, const char *tag)
+{
+	struct dpu_context *ctx = &dpu->ctx;
+
+	drm_info(dpu->drm,
+		 "%s DPU: stopped=%d CTRL=0x%08x CFG0=0x%08x INT_EN=0x%08x INT_STS=0x%08x DPI_CTRL=0x%08x\n",
+		 tag, ctx->stopped,
+		 readl(ctx->base + REG_DPU_CTRL),
+		 readl(ctx->base + REG_DPU_CFG0),
+		 readl(ctx->base + REG_DPU_INT_EN),
+		 readl(ctx->base + REG_DPU_INT_STS),
+		 readl(ctx->base + REG_DPI_CTRL));
 }
 
 static int sprd_plane_atomic_check(struct drm_plane *plane,
@@ -748,6 +798,23 @@ static void sprd_crtc_mode_set_nofb(struct drm_crtc *crtc)
 			dpu->ctx.if_type = SPRD_DPU_IF_DPI;
 		else
 			dpu->ctx.if_type = SPRD_DPU_IF_EDPI;
+	}
+
+	if (dpu->ctx.dpi_clk) {
+		if (dpu->ctx.dpi_clk_fixed) {
+			drm_info(dpu->drm, "dpi pixel clock fixed (div=%u, rate=%lu Hz)\n",
+				 dpu->ctx.dpi_clk_div, clk_get_rate(dpu->ctx.dpi_clk));
+		} else {
+			unsigned long wanted = dpi_clk_khz ?
+				(unsigned long)dpi_clk_khz * 1000UL :
+				(unsigned long)mode->clock * 1000UL;
+			long rounded = clk_round_rate(dpu->ctx.dpi_clk, wanted);
+
+			if (rounded > 0)
+				clk_set_rate(dpu->ctx.dpi_clk, rounded);
+			drm_info(dpu->drm, "dpi pixel clock wanted=%lu actual=%lu Hz\n",
+				 wanted, clk_get_rate(dpu->ctx.dpi_clk));
+		}
 	}
 
 	sprd_dpi_init(dpu);
@@ -958,11 +1025,54 @@ static int sprd_dpu_context_init(struct sprd_dpu *dpu,
 		dev_err(dev, "failed to get DPU dpi clock\n");
 		return PTR_ERR(ctx->dpi_clk);
 	}
-	if (ctx->dpi_clk) {
-		int ret = clk_set_rate(ctx->dpi_clk, 38400000);
 
-		if (ret)
-			dev_warn(dev, "failed to set dpi clock rate: %d\n", ret);
+	of_property_read_u32(dev->of_node, "sprd,dpi-clk-div", &ctx->dpi_clk_div);
+	ctx->dpi_clk_fixed = ctx->dpi_clk_div && !dpi_clk_set_rate;
+
+	if (ctx->dpi_clk) {
+		struct clk *dpi_parent;
+
+		dpi_parent = of_clk_get_by_name(dev->of_node, "dpi-parent");
+		if (IS_ERR(dpi_parent)) {
+			struct device_node *parent_np;
+
+			parent_np = of_parse_phandle(dev->of_node, "sprd,dpi-clk-parent", 0);
+			if (parent_np) {
+				struct of_phandle_args clkspec;
+
+				of_node_put(parent_np);
+				if (!of_parse_phandle_with_args(dev->of_node,
+								"sprd,dpi-clk-parent",
+								"#clock-cells", 0, &clkspec)) {
+					dpi_parent = of_clk_get_from_provider(&clkspec);
+					of_node_put(clkspec.np);
+				}
+			}
+		}
+		if (!IS_ERR_OR_NULL(dpi_parent)) {
+			ret = clk_set_parent(ctx->dpi_clk, dpi_parent);
+			if (ret)
+				dev_warn(dev, "failed to reparent dpi clock: %d\n", ret);
+			clk_put(dpi_parent);
+		}
+		dev_info(dev, "dpi clock rate at probe: %lu Hz (div=%u fixed=%d)\n",
+			 clk_get_rate(ctx->dpi_clk), ctx->dpi_clk_div,
+			 ctx->dpi_clk_fixed);
+	}
+
+	{
+		u32 args[3];
+
+		ctx->qos_syscon = syscon_regmap_lookup_by_phandle_args(dev->of_node,
+								       "sprd,qos-syscon",
+								       3, args);
+		if (IS_ERR(ctx->qos_syscon)) {
+			ctx->qos_syscon = NULL;
+		} else {
+			ctx->qos_offset = args[0];
+			ctx->qos_mask = args[1];
+			ctx->qos_val = args[2];
+		}
 	}
 
 	/*
@@ -1002,6 +1112,9 @@ static int sprd_dpu_context_init(struct sprd_dpu *dpu,
 			ctx->dvfs_index = args[1];
 		}
 	}
+
+	if (ctx->dvfs_syscon)
+		regmap_write(ctx->dvfs_syscon, ctx->dvfs_offset, ctx->dvfs_index);
 
 	/* disable and clear interrupts before register dpu IRQ. */
 	writel(0x00, ctx->base + REG_DPU_INT_EN);

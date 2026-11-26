@@ -28,11 +28,34 @@ static void panfrost_devfreq_update_utilization(struct panfrost_devfreq *pfdevfr
 	pfdevfreq->time_last_update = now;
 }
 
+static void panfrost_devfreq_set_mem_clk(struct panfrost_device *pfdev,
+					 unsigned long core_freq)
+{
+	unsigned long mem_freq;
+	int err;
+
+	if (!pfdev->mem_freq_clock)
+		return;
+
+	/*
+	 * Cap coupled gpu-mem-clk at 768 MHz (twpll_768m) while tracking lower
+	 * core OPPs 1:1 (384/512/614.4/768 MHz) so it stays within the vddgpu
+	 * rail budget at every OPP.
+	 */
+	mem_freq = min_t(unsigned long, core_freq, 768000000UL);
+	err = clk_set_rate(pfdev->mem_freq_clock, mem_freq);
+	if (err)
+		dev_warn_ratelimited(pfdev->base.dev,
+				     "failed to set mem_clk to %lu: %d\n",
+				     mem_freq, err);
+}
+
 static int panfrost_devfreq_target(struct device *dev, unsigned long *freq,
 				   u32 flags)
 {
 	struct panfrost_device *pfdev = dev_get_drvdata(dev);
 	struct dev_pm_opp *opp;
+	unsigned long old_freq = pfdev->pfdevfreq.current_frequency;
 	int err;
 
 	opp = devfreq_recommended_opp(dev, freq, flags);
@@ -40,9 +63,18 @@ static int panfrost_devfreq_target(struct device *dev, unsigned long *freq,
 		return PTR_ERR(opp);
 	dev_pm_opp_put(opp);
 
+	/* Lower mem_clk before dropping vddgpu; raise vddgpu before raising mem_clk. */
+	if (*freq < old_freq)
+		panfrost_devfreq_set_mem_clk(pfdev, *freq);
+
 	err = dev_pm_opp_set_rate(dev, *freq);
-	if (!err)
+	if (!err) {
 		pfdev->pfdevfreq.current_frequency = *freq;
+		if (*freq >= old_freq)
+			panfrost_devfreq_set_mem_clk(pfdev, *freq);
+	} else if (*freq < old_freq) {
+		panfrost_devfreq_set_mem_clk(pfdev, old_freq);
+	}
 
 	return err;
 }
@@ -189,6 +221,7 @@ int panfrost_devfreq_init(struct panfrost_device *pfdev)
 		DRM_DEV_ERROR(dev, "Couldn't set recommended OPP\n");
 		return ret;
 	}
+	panfrost_devfreq_set_mem_clk(pfdev, cur_freq);
 
 	/* Find the fastest defined rate  */
 	opp = dev_pm_opp_find_freq_floor(dev, &freq);

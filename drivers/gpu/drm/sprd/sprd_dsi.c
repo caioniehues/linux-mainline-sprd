@@ -150,6 +150,64 @@
 #define host_to_dsi(host) \
 	container_of(host, struct sprd_dsi, host)
 
+static bool cmd_retry = true;
+module_param(cmd_retry, bool, 0644);
+static unsigned int cmd_drain_us = 5000;
+module_param(cmd_drain_us, uint, 0644);
+static unsigned int fifo_timeout_us = 20000;
+module_param(fifo_timeout_us, uint, 0644);
+static bool skip_init;
+module_param(skip_init, bool, 0644);
+static bool init_lp_cmd = true;
+module_param(init_lp_cmd, bool, 0644);
+static bool video_lp_cmd = true;
+module_param(video_lp_cmd, bool, 0644);
+static bool porch_lp;
+module_param(porch_lp, bool, 0644);
+static unsigned int esc_clk_khz;
+module_param(esc_clk_khz, uint, 0644);
+static bool pll_pixelclock = true;
+module_param(pll_pixelclock, bool, 0644);
+static bool ta_en = true;
+module_param(ta_en, bool, 0644);
+static bool hs_after_init = true;
+module_param(hs_after_init, bool, 0644);
+static bool stop_dpu_first = true;
+module_param(stop_dpu_first, bool, 0644);
+static bool video_halt = true;
+module_param(video_halt, bool, 0644);
+bool dphy_reg02 = true;
+module_param(dphy_reg02, bool, 0644);
+
+static int __init sprd_dsi_cmd_retry_setup(char *s) { return kstrtobool(s, &cmd_retry) == 0; }
+__setup("sprd_dsi.cmd_retry=", sprd_dsi_cmd_retry_setup);
+static int __init sprd_dsi_cmd_drain_setup(char *s) { return kstrtouint(s, 0, &cmd_drain_us) == 0; }
+__setup("sprd_dsi.cmd_drain_us=", sprd_dsi_cmd_drain_setup);
+static int __init sprd_dsi_fifo_timeout_setup(char *s) { return kstrtouint(s, 0, &fifo_timeout_us) == 0; }
+__setup("sprd_dsi.fifo_timeout_us=", sprd_dsi_fifo_timeout_setup);
+static int __init sprd_dsi_skip_init_setup(char *s) { return kstrtobool(s, &skip_init) == 0; }
+__setup("sprd_dsi.skip_init=", sprd_dsi_skip_init_setup);
+static int __init sprd_dsi_init_lp_cmd_setup(char *s) { return kstrtobool(s, &init_lp_cmd) == 0; }
+__setup("sprd_dsi.init_lp_cmd=", sprd_dsi_init_lp_cmd_setup);
+static int __init sprd_dsi_video_lp_cmd_setup(char *s) { return kstrtobool(s, &video_lp_cmd) == 0; }
+__setup("sprd_dsi.video_lp_cmd=", sprd_dsi_video_lp_cmd_setup);
+static int __init sprd_dsi_porch_lp_setup(char *s) { return kstrtobool(s, &porch_lp) == 0; }
+__setup("sprd_dsi.porch_lp=", sprd_dsi_porch_lp_setup);
+static int __init sprd_dsi_esc_clk_setup(char *s) { return kstrtouint(s, 0, &esc_clk_khz) == 0; }
+__setup("sprd_dsi.esc_clk_khz=", sprd_dsi_esc_clk_setup);
+static int __init sprd_dsi_pll_pixelclock_setup(char *s) { return kstrtobool(s, &pll_pixelclock) == 0; }
+__setup("sprd_dsi.pll_pixelclock=", sprd_dsi_pll_pixelclock_setup);
+static int __init sprd_dsi_ta_en_setup(char *s) { return kstrtobool(s, &ta_en) == 0; }
+__setup("sprd_dsi.ta_en=", sprd_dsi_ta_en_setup);
+static int __init sprd_dsi_hs_after_init_setup(char *s) { return kstrtobool(s, &hs_after_init) == 0; }
+__setup("sprd_dsi.hs_after_init=", sprd_dsi_hs_after_init_setup);
+static int __init sprd_dsi_stop_dpu_first_setup(char *s) { return kstrtobool(s, &stop_dpu_first) == 0; }
+__setup("sprd_dsi.stop_dpu_first=", sprd_dsi_stop_dpu_first_setup);
+static int __init sprd_dsi_video_halt_setup(char *s) { return kstrtobool(s, &video_halt) == 0; }
+__setup("sprd_dsi.video_halt=", sprd_dsi_video_halt_setup);
+static int __init sprd_dsi_dphy_reg02_setup(char *s) { return kstrtobool(s, &dphy_reg02) == 0; }
+__setup("sprd_dsi.dphy_reg02=", sprd_dsi_dphy_reg02_setup);
+
 static inline u32
 dsi_reg_rd(struct dsi_context *ctx, u32 offset, u32 mask,
 	   u32 shift)
@@ -299,11 +357,29 @@ static int dphy_wait_pll_locked(struct dsi_context *ctx)
 	return -ETIMEDOUT;
 }
 
+static void dsi_dump_state(struct dsi_context *ctx, const char *tag)
+{
+	struct sprd_dsi *dsi = container_of(ctx, struct sprd_dsi, ctx);
+
+	drm_info(dsi->drm,
+		 "%s DSI: MODE_CFG=0x%08x PHY_STATUS=0x%08x CLK_LP=0x%08x CMD_STS=0x%08x PROTO_INT=0x%08x INT_INT=0x%08x\n",
+		 tag,
+		 readl(ctx->base + DSI_MODE_CFG),
+		 readl(ctx->base + PHY_STATUS),
+		 readl(ctx->base + PHY_CLK_LANE_LP_CTRL),
+		 readl(ctx->base + CMD_MODE_STATUS),
+		 readl(ctx->base + PROTOCOL_INT_STS),
+		 readl(ctx->base + INTERNAL_INT_STS));
+
+	if (dsi->encoder.crtc)
+		sprd_dpu_dump_state(to_sprd_crtc(dsi->encoder.crtc), tag);
+}
+
 static int dsi_wait_tx_payload_fifo_empty(struct dsi_context *ctx)
 {
-	int i;
+	unsigned int i;
 
-	for (i = 0; i < 5000; i++) {
+	for (i = 0; i < fifo_timeout_us; i++) {
 		if (dsi_reg_rd(ctx, CMD_MODE_STATUS, GEN_CMD_WDATA_FIFO_EMPTY, 3))
 			return 0;
 		udelay(1);
@@ -314,9 +390,9 @@ static int dsi_wait_tx_payload_fifo_empty(struct dsi_context *ctx)
 
 static int dsi_wait_tx_cmd_fifo_empty(struct dsi_context *ctx)
 {
-	int i;
+	unsigned int i;
 
-	for (i = 0; i < 5000; i++) {
+	for (i = 0; i < fifo_timeout_us; i++) {
 		if (dsi_reg_rd(ctx, CMD_MODE_STATUS, GEN_CMD_CMD_FIFO_EMPTY, 5))
 			return 0;
 		udelay(1);
@@ -467,11 +543,15 @@ static void sprd_dsi_init(struct dsi_context *ctx)
 	dsi_reg_up(ctx, EOTP_EN, TX_EOTP_EN, 0);
 	dsi_reg_up(ctx, RX_PKT_CHECK_CONFIG, RX_PKT_ECC_EN, RX_PKT_ECC_EN);
 	dsi_reg_up(ctx, RX_PKT_CHECK_CONFIG, RX_PKT_CRC_EN, RX_PKT_CRC_EN);
-	writel(1, ctx->base + TA_EN);
+	writel(ta_en ? 1 : 0, ctx->base + TA_EN);
 	dsi_reg_up(ctx, VIRTUAL_CHANNEL_ID, VIDEO_PKT_VCID, 0);
 	dsi_reg_up(ctx, VIRTUAL_CHANNEL_ID, GEN_RX_VCID, 0);
 
-	div = DIV_ROUND_UP(byte_clk, dsi->slave->lp_rate / 1000);
+	{
+		u32 target_esc = esc_clk_khz ? esc_clk_khz :
+				 max_t(u32, dsi->slave->lp_rate / 1000, 1);
+		div = DIV_ROUND_UP(byte_clk, target_esc);
+	}
 	writel(div, ctx->base + TX_ESC_CLK_CONFIG);
 
 	max_rd_time = ns_to_cycle(ctx->max_rd_time, byte_clk);
@@ -555,9 +635,11 @@ static int sprd_dsi_dpi_video(struct dsi_context *ctx)
 	dsi_reg_wr(ctx, VIDEO_VBLK_LINES, VBP_LINES, 10, vm->vback_porch);
 	dsi_reg_wr(ctx, VIDEO_VBLK_LINES, VSA_LINES, 20, vm->vsync_len);
 	writel(0x80, ctx->base + VBLK_CMD_TRANS_LIMIT);
-	dsi_reg_up(ctx, VID_MODE_CFG, LP_HBP_EN | LP_HFP_EN | LP_VACT_EN |
-			LP_VFP_EN | LP_VBP_EN | LP_VSA_EN, LP_HBP_EN | LP_HFP_EN |
-			LP_VACT_EN | LP_VFP_EN | LP_VBP_EN | LP_VSA_EN);
+	dsi_reg_up(ctx, VID_MODE_CFG,
+		   LP_VACT_EN | LP_VFP_EN | LP_VBP_EN | LP_VSA_EN,
+		   LP_VACT_EN | LP_VFP_EN | LP_VBP_EN | LP_VSA_EN);
+	dsi_reg_up(ctx, VID_MODE_CFG, LP_HBP_EN | LP_HFP_EN,
+		   porch_lp ? (LP_HBP_EN | LP_HFP_EN) : 0);
 	dsi_reg_up(ctx, VID_MODE_CFG, DPI_HSYNC_POL | DPI_VSYNC_POL |
 			DPI_COLOR_MODE_POL | DPI_SHUT_DOWN_POL, 0);
 
@@ -825,24 +907,8 @@ static void sprd_dsi_set_work_mode(struct dsi_context *ctx, u8 mode)
 	if (mode == DSI_MODE_CMD)
 		writel(1, ctx->base + DSI_MODE_CFG);
 	else
-		/*
-		 * Video mode: bit0=0 selects video, bit1=DSI_VIDEO_HALT_EN.
-		 * We write plain 0 (halt DISABLED), NOT DSI_VIDEO_HALT_EN.
-		 *
-		 * Live measurement on 2026-06-26 (see DISPLAY-KNOWN-GOOD-DSI-STATE.md)
-		 * settles the question the old comment got backwards: in the working
-		 * U-Boot-handoff state (panel visibly showing fbcon) DSI_MODE_CFG reads
-		 * 0x0 and the data lanes transmit HS (PHY_STATUS=0x1f02). In the broken
-		 * kernel-native state DSI_MODE_CFG read 0x2 (halt enabled) and the lanes
-		 * sat parked in stopstate (PHY_STATUS=0x1f32) -> black panel. Clearing
-		 * the bit live (devmemn 0x20400018 0) immediately dropped PHY_STATUS to
-		 * 0x1f02 and freed the lanes. The DPU-side halt is already disabled
-		 * (sprd_dpu.c "fix #5"), so arming only the DSI half left the lanes
-		 * waiting on a handshake the DPU never drives. Keep both halves off and
-		 * consistent. (Remaining wall after this is DPU scanout / DPU-RUN
-		 * ordering, not the DSI register.)
-		 */
-		writel(0, ctx->base + DSI_MODE_CFG);
+		writel(video_halt ? DSI_VIDEO_HALT_EN : 0,
+		       ctx->base + DSI_MODE_CFG);
 }
 
 static void sprd_dsi_state_reset(struct dsi_context *ctx)
@@ -975,13 +1041,43 @@ static void sprd_dsi_bridge_pre_enable(struct drm_bridge *bridge)
 {
 	struct sprd_dsi *dsi = bridge_to_dsi(bridge);
 	struct dsi_context *ctx = &dsi->ctx;
+	struct sprd_dpu *dpu = dsi->encoder.crtc ?
+		to_sprd_crtc(dsi->encoder.crtc) : NULL;
+	unsigned long orig_pixclk;
 
 	clk_prepare_enable(ctx->clk);
+
+	if (skip_init) {
+		if (video_lp_cmd && ctx->work_mode == DSI_MODE_VIDEO)
+			dsi_reg_up(ctx, VID_MODE_CFG, LP_CMD_EN, LP_CMD_EN);
+		drm_info(dsi->drm, "skip_init=1: keeping bootloader DSI state\n");
+		return;
+	}
+
+	if (stop_dpu_first && dpu && !dpu->ctx.stopped)
+		sprd_dpu_halt(dpu);
 
 	/* clear the bootloader's pinned state, then fully re-init below */
 	sprd_dsi_reset(ctx);
 
 	sprd_dsi_init(ctx);
+
+	orig_pixclk = ctx->vm.pixelclock;
+	if (pll_pixelclock && ctx->dpi_clk_div && dsi->slave->hs_rate) {
+		unsigned long pix = DIV_ROUND_CLOSEST_ULL(dsi->slave->hs_rate,
+							  ctx->dpi_clk_div);
+		if (pix)
+			ctx->vm.pixelclock = pix;
+	} else if (dpu && dpu->ctx.dpi_clk) {
+		unsigned long rate = clk_get_rate(dpu->ctx.dpi_clk);
+
+		if (rate)
+			ctx->vm.pixelclock = rate;
+	}
+	drm_info(dsi->drm, "dsi pixelclock=%lu Hz (orig=%lu Hz, pll_div=%u)\n",
+		 ctx->vm.pixelclock, orig_pixclk,
+		 pll_pixelclock ? ctx->dpi_clk_div : 0);
+
 	if (ctx->work_mode == DSI_MODE_VIDEO)
 		sprd_dsi_dpi_video(ctx);
 	else
@@ -989,30 +1085,13 @@ static void sprd_dsi_bridge_pre_enable(struct drm_bridge *bridge)
 
 	sprd_dphy_init(ctx);
 
-	/*
-	 * Send the panel init sequence in LP, matching the vendor BSP
-	 * (mipi_dsi_lp_cmd_enable(true) before the init writes). The earlier
-	 * HS-init experiment left every command class in HS; with the DSI now
-	 * streaming clean burst video, the remaining failure is the panel not
-	 * latching init, so revert to the vendor-proven LP command transport.
-	 */
-	dsi_reg_up(ctx, CMD_MODE_CFG, CMD_MODE_LP_CMD_EN, CMD_MODE_LP_CMD_EN);
+	dsi_reg_up(ctx, CMD_MODE_CFG, CMD_MODE_LP_CMD_EN,
+		   init_lp_cmd ? CMD_MODE_LP_CMD_EN : 0);
 
-	/*
-	 * Arm clock-lane auto-HS control BEFORE the panel's prepare runs (it now
-	 * runs after this, via prepare_prev_first). Without the clock lane able
-	 * to engage, the command FIFO never drains and the very first panel init
-	 * write times out ("tx cmd fifo is not empty", -ETIMEDOUT). This used to
-	 * be set only in bridge_enable (after prepare), which is why cold-init
-	 * panel writes failed while the warm rebind path (clock lane already up
-	 * from a prior enable) succeeded. Our panel is MIPI_DSI_CLOCK_NON_-
-	 * CONTINUOUS, so use the auto-clklane path; bridge_enable re-applies the
-	 * matching setting.
-	 */
 	if (dsi->slave->mode_flags & MIPI_DSI_CLOCK_NON_CONTINUOUS) {
 		dsi_reg_up(ctx, PHY_CLK_LANE_LP_CTRL, AUTO_CLKLANE_CTRL_EN,
 			   AUTO_CLKLANE_CTRL_EN);
-	} else {
+	} else if (!(hs_after_init && init_lp_cmd)) {
 		dsi_reg_up(ctx, PHY_CLK_LANE_LP_CTRL, PHY_CLKLANE_TX_REQ_HS,
 			   PHY_CLKLANE_TX_REQ_HS);
 		dphy_wait_pll_locked(ctx);
@@ -1035,12 +1114,13 @@ static void sprd_dsi_bridge_enable(struct drm_bridge *bridge)
 	/*
 	 * Vendor BSP power-cycles the controller (SOFT_RESET 0->1) right after
 	 * switching from cmd mode to video mode. This is what actually arms
-	 * the video pixel FSM: without it the controller stays in the cmd-mode
-	 * state where it accepts panel init writes but never streams DPI video
-	 * packets out to the panel. The DPU and DPHY both look fine, but no
-	 * pixels reach the panel.
+	 * the video pixel FSM.
 	 */
 	sprd_dsi_state_reset(ctx);
+
+	dsi_reg_up(ctx, VID_MODE_CFG, LP_CMD_EN,
+		   (video_lp_cmd && ctx->work_mode == DSI_MODE_VIDEO) ?
+		   LP_CMD_EN : 0);
 
 	if (dsi->slave->mode_flags & MIPI_DSI_CLOCK_NON_CONTINUOUS) {
 		dsi_reg_up(ctx, PHY_CLK_LANE_LP_CTRL, AUTO_CLKLANE_CTRL_EN,
@@ -1184,6 +1264,14 @@ static int sprd_dsi_context_init(struct sprd_dsi *dsi,
 		}
 	}
 
+	{
+		u32 val = 0;
+
+		if (!of_property_read_u32(dev->of_node, "sprd,mipi-drive-capability", &val))
+			ctx->drive_cap = val & 0x7;
+		of_property_read_u32(dev->of_node, "sprd,dpi-clk-div", &ctx->dpi_clk_div);
+	}
+
 	ctx->data_hs2lp = 120;
 	ctx->data_lp2hs = 500;
 	ctx->clk_hs2lp = 4;
@@ -1273,25 +1361,78 @@ static int sprd_dsi_host_detach(struct mipi_dsi_host *host,
 	return 0;
 }
 
+static int sprd_dsi_wait_cmd_drain(struct dsi_context *ctx)
+{
+	const u32 mask = GEN_CMD_WDATA_FIFO_EMPTY | GEN_CMD_CMD_FIFO_EMPTY;
+	unsigned int i;
+
+	if (!cmd_drain_us)
+		return 0;
+
+	for (i = 0; i < cmd_drain_us; i++) {
+		if ((readl(ctx->base + CMD_MODE_STATUS) & mask) == mask)
+			return 0;
+		udelay(1);
+	}
+
+	return -ETIMEDOUT;
+}
+
 static ssize_t sprd_dsi_host_transfer(struct mipi_dsi_host *host,
 				      const struct mipi_dsi_msg *msg)
 {
 	struct sprd_dsi *dsi = host_to_dsi(host);
+	struct dsi_context *ctx = &dsi->ctx;
 	const u8 *tx_buf = msg->tx_buf;
+	int attempt, max_attempts, ret;
 
 	if (msg->rx_buf && msg->rx_len) {
 		u8 lsb = (msg->tx_len > 0) ? tx_buf[0] : 0;
 		u8 msb = (msg->tx_len > 1) ? tx_buf[1] : 0;
 
-		return sprd_dsi_rd_pkt(&dsi->ctx, msg->channel, msg->type,
+		return sprd_dsi_rd_pkt(ctx, msg->channel, msg->type,
 				msb, lsb, msg->rx_buf, msg->rx_len);
 	}
 
-	if (msg->tx_buf && msg->tx_len)
-		return sprd_dsi_wr_pkt(&dsi->ctx, msg->channel, msg->type,
-					tx_buf, msg->tx_len);
+	if (!msg->tx_buf || !msg->tx_len)
+		return 0;
 
-	return 0;
+	max_attempts = cmd_retry ? 3 : 1;
+	for (attempt = 0; attempt < max_attempts; attempt++) {
+		ret = sprd_dsi_wr_pkt(ctx, msg->channel, msg->type,
+				      tx_buf, msg->tx_len);
+		if (!ret)
+			ret = sprd_dsi_wait_cmd_drain(ctx);
+		if (!ret)
+			return 0;
+
+		drm_err(dsi->drm,
+			"dsi tx failed (type=0x%02x len=%zu ret=%d attempt=%d/%d)\n",
+			msg->type, msg->tx_len, ret, attempt + 1, max_attempts);
+		dsi_dump_state(ctx, "tx_err");
+
+		if (!cmd_retry || attempt + 1 >= max_attempts)
+			return ret;
+
+		dsi_clear_int_status(ctx);
+		udelay(20);
+
+		if (attempt >= 1) {
+			drm_warn(dsi->drm, "dsi tx recovery: resetting controller\n");
+			sprd_dsi_state_reset(ctx);
+			sprd_dsi_init(ctx);
+			if (ctx->work_mode == DSI_MODE_VIDEO)
+				sprd_dsi_dpi_video(ctx);
+			else
+				sprd_dsi_edpi_video(ctx);
+			dsi_reg_up(ctx, CMD_MODE_CFG, CMD_MODE_LP_CMD_EN,
+				   init_lp_cmd ? CMD_MODE_LP_CMD_EN : 0);
+			dsi_clear_int_status(ctx);
+			udelay(50);
+		}
+	}
+
+	return ret;
 }
 
 static const struct mipi_dsi_host_ops sprd_dsi_host_ops = {

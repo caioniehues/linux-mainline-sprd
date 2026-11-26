@@ -1757,7 +1757,7 @@ static SPRD_COMP_CLK_DATA_REPARENT(gpu_core_clk, "gpu-core-clk", gpu_parents,
 static SPRD_GATE_CLK_HW(gpu_mem_gate, "gpu-mem-gate", &gpu_eb.common.hw,
 			0x8, BIT(0), 0, 0);
 
-static SPRD_COMP_CLK_DATA(gpu_mem_clk, "gpu-mem-clk", gpu_parents,
+static SPRD_COMP_CLK_DATA_REPARENT(gpu_mem_clk, "gpu-mem-clk", gpu_parents,
 			  0x8, 4, 3, 8, 3, 0);
 
 static SPRD_GATE_CLK_HW(gpu_sys_gate, "gpu-sys-gate", &gpu_eb.common.hw,

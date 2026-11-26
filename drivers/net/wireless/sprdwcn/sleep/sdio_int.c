@@ -88,7 +88,8 @@ static int pub_int_handle_thread(void *data)
 
 	set_user_nice(current, -20);
 	while (!kthread_should_stop()) {
-		wait_for_completion(&(sdio_int.pub_int_completion));
+		wait_for_completion_state(&(sdio_int.pub_int_completion),
+					  TASK_IDLE | TASK_FREEZABLE);
 
 		ret = sprdwcn_bus_aon_readb(sdio_int.pub_int_sts0,
 			&(pub_int_sts0.reg));

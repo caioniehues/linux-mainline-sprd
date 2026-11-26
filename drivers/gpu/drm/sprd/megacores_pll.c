@@ -74,29 +74,36 @@ static int dphy_calc_pll_param(struct dphy_pll *pll)
 
 static void dphy_set_pll_reg(struct dphy_pll *pll, struct regmap *regmap)
 {
-	u8 reg_val[9] = {0};
+	u8 reg_val[13] = {0};
 	int i;
 
 	/*
 	 * nint (reg 0x06) is written last to match the vendor sharkl5 BSP,
 	 * which commits the integer divider after all other PLL registers.
 	 */
-	u8 reg_addr[] = {
-		0x03, 0x04, 0x08, 0x09, 0x0a,
-		0x0b, 0x0e, 0x0f, 0x06
+	static const u8 reg_addr[13] = {
+		0x02, 0x03, 0x04, 0x07, 0x08, 0x09, 0x0a,
+		0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x06
 	};
 
-	reg_val[0] = 1 | (1 << 1) |  (pll->lpf_sel << 2);
-	reg_val[1] = pll->div | (1 << 3) | (pll->cp_s << 5) | (pll->fdk_s << 7);
-	reg_val[2] = pll->vco_band | (pll->sdm_en << 1) | (pll->refin << 2);
-	reg_val[3] = pll->kint >> 12;
-	reg_val[4] = pll->kint >> 4;
-	reg_val[5] = pll->out_sel | ((pll->kint & 0xf) << 4);
-	reg_val[6] = 1 << 4;
-	reg_val[7] = pll->det_delay;
-	reg_val[8] = pll->nint;
+	reg_val[0] = 0xe0;
+	reg_val[1] = 1 | (1 << 1) | (pll->lpf_sel << 2);
+	reg_val[2] = pll->div | (1 << 3) | (pll->cp_s << 5) | (pll->fdk_s << 7);
+	reg_val[3] = 0x00;
+	reg_val[4] = pll->vco_band | (pll->sdm_en << 1) | (pll->refin << 2);
+	reg_val[5] = pll->kint >> 12;
+	reg_val[6] = pll->kint >> 4;
+	reg_val[7] = pll->out_sel | ((pll->kint & 0xf) << 4);
+	reg_val[8] = 0x00;
+	reg_val[9] = 0x00;
+	reg_val[10] = 1 << 4;
+	reg_val[11] = pll->det_delay;
+	reg_val[12] = pll->nint;
 
-	for (i = 0; i < sizeof(reg_addr); ++i) {
+	for (i = 0; i < ARRAY_SIZE(reg_addr); ++i) {
+		if (!dphy_reg02 && (reg_addr[i] == 0x02 || reg_addr[i] == 0x07 ||
+				    reg_addr[i] == 0x0c || reg_addr[i] == 0x0d))
+			continue;
 		regmap_write(regmap, reg_addr[i], reg_val[i]);
 		DRM_DEBUG("%02x: %02x\n", reg_addr[i], reg_val[i]);
 	}
@@ -118,6 +125,12 @@ int dphy_pll_config(struct dsi_context *ctx)
 		return ret;
 	}
 	dphy_set_pll_reg(pll, regmap);
+
+	if (ctx->drive_cap) {
+		regmap_write(regmap, 0x25, ctx->drive_cap & 0x7);
+		drm_dbg(dsi->drm, "dphy drive capability = %u\n",
+			ctx->drive_cap & 0x7);
+	}
 
 	return 0;
 }

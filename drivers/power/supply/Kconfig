@@ -850,6 +850,15 @@ config CHARGER_BQ256XX
 	  charge management and system power path management devices for single
 	  cell Li-ion and Li-polymer batteries.
 
+config CHARGER_SGM41542
+	tristate "SGMICRO SGM41542 battery charger driver"
+	depends on I2C
+	depends on GPIOLIB || COMPILE_TEST
+	select REGMAP_I2C
+	help
+	  Say Y to enable support for the SGMICRO SGM41542 I2C switching
+	  battery charger with USB OTG boost regulator.
+
 config CHARGER_RK817
 	tristate "Rockchip RK817 PMIC Battery Charger"
 	depends on MFD_RK8XX

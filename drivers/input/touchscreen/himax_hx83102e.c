@@ -22,6 +22,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/panel_generic_dsi.h>
 #include <linux/pm.h>
 #include <linux/regulator/consumer.h>
 #include <linux/slab.h>
@@ -171,6 +172,7 @@ struct hx83102e {
 	spinlock_t irq_lock;
 	struct delayed_work init_work;
 	struct delayed_work poll_work;
+	struct notifier_block panel_nb;
 	u32 poll_ms;			/* module parameter snapshot, fixed at probe */
 	u32 init_attempts;
 	u32 bus_errors;
@@ -1082,9 +1084,44 @@ static struct attribute *hx_attrs[] = {
 };
 ATTRIBUTE_GROUPS(hx);
 
+static int hx_panel_notify(struct notifier_block *nb,
+			   unsigned long action, void *data)
+{
+	struct hx83102e *hx = container_of(nb, struct hx83102e, panel_nb);
+
+	if (action == GENERIC_PANEL_EVENT_UNPREPARED) {
+		cancel_delayed_work_sync(&hx->init_work);
+		mutex_lock(&hx->state_lock);
+		hx->ready = false;
+		if (hx->irq > 0) {
+			hx_irq_set(hx, false);
+			synchronize_irq(hx->irq);
+		}
+		cancel_delayed_work_sync(&hx->poll_work);
+		input_mt_sync_frame(hx->input);
+		input_mt_report_pointer_emulation(hx->input, true);
+		input_sync(hx->input);
+		mutex_unlock(&hx->state_lock);
+	} else if (action == GENERIC_PANEL_EVENT_PREPARED) {
+		cancel_delayed_work_sync(&hx->init_work);
+		mutex_lock(&hx->state_lock);
+		hx->ready = false;
+		if (hx->irq > 0)
+			hx_irq_set(hx, false);
+		hx->init_attempts = 0;
+		if (!hx->suspended)
+			schedule_delayed_work(&hx->init_work, msecs_to_jiffies(150));
+		mutex_unlock(&hx->state_lock);
+	}
+
+	return NOTIFY_OK;
+}
+
 static void hx_remove(struct spi_device *spi)
 {
 	struct hx83102e *hx = spi_get_drvdata(spi);
+
+	generic_panel_unregister_notifier(&hx->panel_nb);
 
 	/* Stop first: the IRQ and poll paths can queue init_work until they are quiet. */
 	mutex_lock(&hx->state_lock);
@@ -1244,6 +1281,9 @@ static int hx_probe(struct spi_device *spi)
 	dev_info(dev, "Himax HX83102E: SPI bus %d cs %u mode 0x%x %u Hz irq %d fw %s\n",
 		 spi->controller->bus_num, spi_get_chipselect(spi, 0), spi->mode,
 		 spi->max_speed_hz, hx->irq, hx->fw_name);
+
+	hx->panel_nb.notifier_call = hx_panel_notify;
+	generic_panel_register_notifier(&hx->panel_nb);
 
 	schedule_delayed_work(&hx->init_work, msecs_to_jiffies(init_delay_ms));
 	return 0;

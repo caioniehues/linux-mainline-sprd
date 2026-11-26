@@ -11,6 +11,7 @@
 #include <linux/iopoll.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/regmap.h>
 
 #include <drm/drm_print.h>
 
@@ -456,6 +457,8 @@ void panfrost_gpu_power_on(struct panfrost_device *pfdev)
 	u64 core_mask;
 
 	panfrost_gpu_init_quirks(pfdev);
+	if (pfdev->qos_syscon)
+		regmap_write(pfdev->qos_syscon, pfdev->qos_offset, pfdev->qos_val);
 	core_mask = panfrost_get_core_mask(pfdev);
 
 	gpu_write(pfdev, L2_PWRON_LO, pfdev->features.l2_present & core_mask);

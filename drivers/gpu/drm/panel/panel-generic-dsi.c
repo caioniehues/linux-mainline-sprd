@@ -9,6 +9,7 @@
  * Copyright (C) Purism SPC 2019
  */
 
+#include <linux/backlight.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
 #include <linux/hex.h>
@@ -16,6 +17,7 @@
 #include <linux/module.h>
 #include <linux/firmware.h>
 #include <linux/of.h>
+#include <linux/panel_generic_dsi.h>
 #include <linux/regulator/consumer.h>
 
 #include <video/display_timing.h>
@@ -27,9 +29,43 @@
 
 #define DRIVER_NAME "panel-generic-dsi"
 
+static BLOCKING_NOTIFIER_HEAD(generic_panel_notifier_list);
+
+int generic_panel_register_notifier(struct notifier_block *nb)
+{
+    return blocking_notifier_chain_register(&generic_panel_notifier_list, nb);
+}
+EXPORT_SYMBOL_GPL(generic_panel_register_notifier);
+
+int generic_panel_unregister_notifier(struct notifier_block *nb)
+{
+    return blocking_notifier_chain_unregister(&generic_panel_notifier_list, nb);
+}
+EXPORT_SYMBOL_GPL(generic_panel_unregister_notifier);
+
 static char *descfile = "";
 module_param(descfile,charp,0660);
 MODULE_PARM_DESC(descfile, "Panel description filename in firmware dir");
+
+static bool dcs_backlight = true;
+module_param(dcs_backlight, bool, 0644);
+MODULE_PARM_DESC(dcs_backlight, "Register a DCS 0x51 12-bit backlight device");
+
+static unsigned int init_brightness = 0x222;
+module_param(init_brightness, uint, 0644);
+MODULE_PARM_DESC(init_brightness, "Initial 12-bit DCS brightness sent during prepare (0 = skip)");
+
+static bool skip_init;
+module_param(skip_init, bool, 0644);
+MODULE_PARM_DESC(skip_init, "Skip panel prepare/unprepare hardware init (bootloader handoff)");
+
+static unsigned int init_delay_us;
+module_param(init_delay_us, uint, 0644);
+MODULE_PARM_DESC(init_delay_us, "Optional udelay after each init sequence command");
+
+static unsigned int mode_clock_khz;
+module_param(mode_clock_khz, uint, 0644);
+MODULE_PARM_DESC(mode_clock_khz, "Override panel mode pixel clock in kHz (0 = description default)");
 
 struct generic_panel_delays {
     int prepare;
@@ -69,6 +105,7 @@ struct generic_panel {
     struct gpio_desc *reset_gpio;
     struct regulator *vdd;
     struct regulator *iovcc;
+    struct backlight_device *bl;
 
     struct generic_panel_delays delays;
     struct generic_panel_size size;
@@ -396,6 +433,9 @@ static int generic_panel_init_sequence(struct generic_panel *ctx)
         if (iseq->wait) {
             msleep(iseq->wait);
         }
+        if (init_delay_us) {
+            udelay(init_delay_us);
+        }
         iseq = iseq->link;
     }
 
@@ -403,6 +443,29 @@ static int generic_panel_init_sequence(struct generic_panel *ctx)
 
     return 0;
 }
+
+static int generic_panel_bl_update_status(struct backlight_device *bl)
+{
+    struct generic_panel *ctx = bl_get_data(bl);
+    struct mipi_dsi_device *dsi = to_mipi_dsi_device(ctx->dev);
+    u16 b = ((bl->props.brightness * 0xfff + 0x7f) / 0xff) & 0xfff;
+    int ret;
+
+    if (!ctx->prepared)
+        return 0;
+
+    ret = mipi_dsi_dcs_set_display_brightness_large(dsi, b);
+    if (ret < 0) {
+        dev_err(ctx->dev, "failed to set brightness 0x%03x: %d\n", b, ret);
+        return ret;
+    }
+
+    return 0;
+}
+
+static const struct backlight_ops generic_panel_bl_ops = {
+    .update_status = generic_panel_bl_update_status,
+};
 
 /*
  * Assume u-boot left the panel fully initialized and skip the kernel's first
@@ -423,8 +486,6 @@ static int generic_panel_init_sequence(struct generic_panel *ctx)
  * panel stays black is a reboot to the on-disk image. Set back to true to
  * restore the known-good U-Boot-handoff display.
  */
-static bool handoff_skip_first_cycle = false;
-
 static int generic_panel_unprepare(struct drm_panel *panel)
 {
     struct generic_panel *ctx = panel_to_generic_panel(panel);
@@ -434,10 +495,9 @@ static int generic_panel_unprepare(struct drm_panel *panel)
     if (!ctx->prepared)
         return 0;
 
-    if (handoff_skip_first_cycle) {
-        handoff_skip_first_cycle = false;
+    if (skip_init) {
         ctx->prepared = false;
-        dev_info(ctx->dev, "handoff: skipping first unprepare\n");
+        dev_info(ctx->dev, "handoff: skipping unprepare\n");
         return 0;
     }
 
@@ -460,6 +520,8 @@ static int generic_panel_unprepare(struct drm_panel *panel)
     gpiod_set_value_cansleep(ctx->reset_gpio, 1);
 
     ctx->prepared = false;
+    blocking_notifier_call_chain(&generic_panel_notifier_list,
+                                 GENERIC_PANEL_EVENT_UNPREPARED, NULL);
 
     return 0;
 }
@@ -468,14 +530,6 @@ static int generic_panel_prepare(struct drm_panel *panel)
 {
     struct generic_panel *ctx = panel_to_generic_panel(panel);
     struct mipi_dsi_device *dsi = to_mipi_dsi_device(ctx->dev);
-    /*
-     * sleep_out (0x11) and display_on (0x29) are DCS Short Write 0 Param
-     * commands. Sending them via mipi_dsi_dcs_write_buffer with len=2
-     * mis-encodes them as DCS Short Write 1 Param (type 0x15) with a
-     * spurious 0x00 parameter -- many panels silently reject the wrong
-     * packet type and stay asleep, so backlight is on but the display
-     * shows black. Use len=1 to force the correct 0-param encoding.
-     */
     static const u8 sleep_out[] = { MIPI_DCS_EXIT_SLEEP_MODE };
     static const u8 display_on[] = { MIPI_DCS_SET_DISPLAY_ON };
     int dispon_ret;
@@ -485,8 +539,8 @@ static int generic_panel_prepare(struct drm_panel *panel)
         return 0;
     }
 
-    if (handoff_skip_first_cycle) {
-        dev_info(ctx->dev, "handoff: skipping first prepare (assuming u-boot left panel live)\n");
+    if (skip_init) {
+        dev_info(ctx->dev, "handoff: keeping bootloader panel\n");
         ctx->prepared = true;
         return 0;
     }
@@ -508,12 +562,12 @@ static int generic_panel_prepare(struct drm_panel *panel)
     if (ctx->enable_gpio) { gpiod_set_value_cansleep(ctx->enable_gpio, 1); }
     msleep(ctx->delays.prepare);
 
-    /* Stock sequence is physical high 50 ms, low 50 ms, high 120 ms. */
+    /* Active-high DTS reset-gpios: pulse 1 -> 0 -> 1 to release reset high. */
+    gpiod_set_value_cansleep(ctx->reset_gpio, 1);
+    msleep(ctx->delays.prepare);
     gpiod_set_value_cansleep(ctx->reset_gpio, 0);
     msleep(ctx->delays.reset);
     gpiod_set_value_cansleep(ctx->reset_gpio, 1);
-    msleep(ctx->delays.reset);
-    gpiod_set_value_cansleep(ctx->reset_gpio, 0);
     msleep(ctx->delays.init);
 
     ret = generic_panel_init_sequence(ctx);
@@ -522,14 +576,14 @@ static int generic_panel_prepare(struct drm_panel *panel)
         goto disable_iovcc;
     }
 
-    /*
-     * Send sleep_out here but defer display_on to .enable so it fires
-     * AFTER the DSI bridge has switched to video mode. Panels with
-     * dimming/PWM ramp logic (e.g. CTRL_DISPLAY 0x53=0x2c in init) need
-     * a valid video signal to ramp against; sending display_on while
-     * the DSI is still in cmd mode leaves the panel in a "ramp to 0"
-     * state and the screen never lights up even after video starts.
-     */
+    if (init_brightness) {
+        ret = mipi_dsi_dcs_set_display_brightness_large(dsi, init_brightness & 0xfff);
+        dev_info(ctx->dev, "init brightness 0x%03x ret=%d\n",
+                 init_brightness & 0xfff, ret);
+        if (ret < 0)
+            dev_warn(ctx->dev, "failed to set init brightness: %d\n", ret);
+    }
+
     ret = mipi_dsi_dcs_write_buffer(dsi, sleep_out, sizeof(sleep_out));
     if (ret < 0) {
         dev_err(ctx->dev, "Failed to exit sleep mode: %d\n", ret);
@@ -538,55 +592,17 @@ static int generic_panel_prepare(struct drm_panel *panel)
 
     msleep(200);
 
-    /*
-     * Send display_on HERE, in CMD mode, before the bridge switches to
-     * video mode -- matching the vendor BSP which sends sleep_out AND
-     * display_on in cmd mode prior to video. The sprd host .transfer path
-     * does not switch back to cmd mode, so a display_on issued from
-     * .enable (post video-mode switch) is pushed into the command FIFO
-     * while the controller is in VIDEO mode and is not reliably
-     * transmitted -- leaving the panel powered + init'd + sleep-exited but
-     * with its source drivers OFF (pure black, backlight on). The .enable
-     * resend is kept as a harmless belt-and-suspenders.
-     */
     dispon_ret = mipi_dsi_dcs_write_buffer(dsi, display_on, sizeof(display_on));
-    dev_info(ctx->dev, "display_on (cmd-mode) ret=%d\n", dispon_ret);
+    dev_info(ctx->dev, "display_on (cmd mode) ret=%d\n", dispon_ret);
     msleep(20);
 
-    /*
-     * Diagnostic DCS reads DISABLED for the cold-init experiment.
-     *
-     * Each of these issues a BTA which, on this board's broken short-read path,
-     * returns -EIO and parks the data lanes in stopstate (PHY_STATUS
-     * 0x1f02 -> 0x1f32) -> black. They never run on the handoff path (prepare is
-     * skipped), so they are a cold-init-only confound. Re-enable only once the
-     * short-read path is fixed and we want panel-state observability.
-     */
-#if 0
-    {
-        u8 power_mode = 0;
-        u8 display_status[4] = { 0 };
-        u8 id[3] = { 0 };
-        int status_ret;
-
-        status_ret = mipi_dsi_dcs_get_power_mode(dsi, &power_mode);
-        dev_info(ctx->dev, "DCS power mode: ret=%d value=%02x\n",
-                 status_ret, power_mode);
-        status_ret = mipi_dsi_dcs_read(dsi, MIPI_DCS_GET_DISPLAY_STATUS,
-                                       display_status, sizeof(display_status));
-        dev_info(ctx->dev,
-                 "DCS display status: ret=%d value=%*ph\n",
-                 status_ret, (int)sizeof(display_status), display_status);
-        status_ret = mipi_dsi_dcs_read(dsi, MIPI_DCS_GET_DISPLAY_ID,
-                                       id, sizeof(id));
-        dev_info(ctx->dev, "DCS display ID: ret=%d value=%*ph\n",
-                 status_ret, (int)sizeof(id), id);
-    }
-#endif
-
-    //msleep(ctx->delays.ready);
-
     ctx->prepared = true;
+
+    if (ctx->bl)
+        generic_panel_bl_update_status(ctx->bl);
+
+    blocking_notifier_call_chain(&generic_panel_notifier_list,
+                                 GENERIC_PANEL_EVENT_PREPARED, NULL);
 
     return 0;
 
@@ -614,7 +630,7 @@ static int generic_panel_get_modes(struct drm_panel *panel,
 
         mode_tmp = mode_template;
 
-        mode_tmp.clock          = genmode->clock;
+        mode_tmp.clock          = mode_clock_khz ? mode_clock_khz : genmode->clock;
 
         mode_tmp.hdisplay       = genmode->horizontal[1];
         mode_tmp.hsync_start    = mode_tmp.hdisplay + genmode->horizontal[2];
@@ -681,6 +697,9 @@ static int generic_panel_enable(struct drm_panel *panel)
     struct mipi_dsi_device *dsi = to_mipi_dsi_device(ctx->dev);
     static const u8 display_on[] = { MIPI_DCS_SET_DISPLAY_ON };
     int ret;
+
+    if (skip_init)
+        return 0;
 
     ret = mipi_dsi_dcs_write_buffer(dsi, display_on, sizeof(display_on));
     if (ret < 0) {
@@ -792,6 +811,32 @@ static int generic_panel_probe(struct mipi_dsi_device *dsi)
     ret = drm_panel_of_backlight(&ctx->panel);
     if (ret)
         return ret;
+
+    if (dcs_backlight) {
+        struct backlight_properties props = {
+            .type = BACKLIGHT_RAW,
+            .max_brightness = 255,
+            .brightness = init_brightness ?
+                ((init_brightness * 0xff + 0x7ff) / 0xfff) : 0,
+        };
+        u32 def_level;
+
+        if (!of_property_read_u32(dev->of_node, "default-brightness-level", &def_level))
+            props.brightness = min_t(u32, def_level, 255);
+        if (props.brightness > 255)
+            props.brightness = 255;
+
+        ctx->bl = devm_backlight_device_register(dev, "panel_backlight", dev,
+                                                 ctx, &generic_panel_bl_ops, &props);
+        if (IS_ERR(ctx->bl)) {
+            dev_err(dev, "failed to register DCS backlight: %ld\n", PTR_ERR(ctx->bl));
+            ctx->bl = NULL;
+        } else {
+            dev_info(dev, "backlight registered: level %u (%u/4095)\n",
+                     props.brightness,
+                     ((props.brightness * 0xfff + 0x7f) / 0xff) & 0xfff);
+        }
+    }
 
     drm_panel_add(&ctx->panel);
 

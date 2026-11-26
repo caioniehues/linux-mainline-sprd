@@ -136,6 +136,8 @@ struct dsi_context {
 	bool frame_ack_en;
 	/* enable receiving tear effect ack packets - for cmd mode */
 	bool te_ack_en;
+	u32 dpi_clk_div;
+	u8 drive_cap;
 };
 
 struct sprd_dsi {
@@ -148,6 +150,8 @@ struct sprd_dsi {
 	struct drm_connector *connector;
 	struct dsi_context ctx;
 };
+
+extern bool dphy_reg02;
 
 int dphy_pll_config(struct dsi_context *ctx);
 void dphy_timing_config(struct dsi_context *ctx);

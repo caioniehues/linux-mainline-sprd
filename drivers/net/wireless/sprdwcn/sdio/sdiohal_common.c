@@ -237,7 +237,7 @@ void sdiohal_tx_down(void)
 	 * cannot make this return either, so the result is always 0.
 	 */
 	wait_for_completion_state(&p_data->tx_completed,
-				  TASK_UNINTERRUPTIBLE | TASK_FREEZABLE);
+				  TASK_IDLE | TASK_FREEZABLE);
 }
 
 void sdiohal_tx_up(void)
@@ -251,7 +251,8 @@ void sdiohal_rx_down(void)
 {
 	struct sdiohal_data_t *p_data = sdiohal_get_data();
 
-	wait_for_completion(&p_data->rx_completed);
+	wait_for_completion_state(&p_data->rx_completed,
+				  TASK_IDLE | TASK_FREEZABLE);
 }
 
 void sdiohal_rx_up(void)

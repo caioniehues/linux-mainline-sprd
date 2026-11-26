@@ -300,7 +300,7 @@ int mdbg_loopcheck_read(int channel, struct mbuf_t *head,
 		memcpy(mdbg_proc->loopcheck.buf, head->buf, head->len);
 		mdbg_proc->loopcheck.rcv_len = head->len;
 	}
-	WCN_INFO("rx:%s\n", (char *)(mdbg_proc->loopcheck.buf));
+	WCN_DBG("rx:%s\n", (char *)(mdbg_proc->loopcheck.buf));
 	mdbg_proc->fail_count = 0;
 	complete(&mdbg_proc->loopcheck.completed);
 	complete_kernel_loopcheck();

@@ -60,6 +60,12 @@ struct dpu_context {
 	struct regmap *dvfs_syscon;
 	u32 dvfs_offset;
 	u32 dvfs_index;
+	struct regmap *qos_syscon;
+	u32 qos_offset;
+	u32 qos_mask;
+	u32 qos_val;
+	u32 dpi_clk_div;
+	bool dpi_clk_fixed;
 };
 
 /**
@@ -114,5 +120,7 @@ layer_reg_wr(struct dpu_context *ctx, u32 offset, u32 cfg_bits, int index)
 
 void sprd_dpu_run(struct sprd_dpu *dpu);
 void sprd_dpu_stop(struct sprd_dpu *dpu);
+void sprd_dpu_halt(struct sprd_dpu *dpu);
+void sprd_dpu_dump_state(struct sprd_dpu *dpu, const char *tag);
 
 #endif

@@ -445,7 +445,7 @@ void audio_mem_unmap(const void *mem)
 			if (map->mem_real == mem) {
 				list_del(&map->map_list);
 				spin_unlock_irqrestore(&smem->lock, flags);
-				memunmap(map->mem);
+				memunmap((void *)map->mem);
 				kfree(map);
 				return;
 			}
