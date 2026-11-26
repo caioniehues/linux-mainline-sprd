@@ -144,6 +144,7 @@ static void sc27xx_fgu_capacity_calibration(struct sc27xx_fgu_data *data,
 					    int cap, bool int_mode);
 static void sc27xx_fgu_adjust_cap(struct sc27xx_fgu_data *data, int cap);
 static int sc27xx_fgu_get_temp(struct sc27xx_fgu_data *data, int *temp);
+static int sc27xx_fgu_get_vbat_ocv(struct sc27xx_fgu_data *data, int *val);
 
 static const char * const sc27xx_charger_supply_name[] = {
 	"sc2731_charger",
@@ -319,16 +320,28 @@ static int sc27xx_fgu_get_boot_capacity(struct sc27xx_fgu_data *data, int *cap)
 	oci = sc27xx_fgu_adc_to_current(data, cur - SC27XX_FGU_CUR_BASIC_ADC);
 
 	/*
-	 * Should get the OCV from SC27XX_FGU_POCV register at the system
-	 * beginning. It is ADC values reading from registers which need to
-	 * convert the corresponding voltage.
+	 * SC27XX_FGU_POCV is only latched at battery-connect POR and becomes
+	 * stale across warm reboots. Measure live OCV on warm reboots, and
+	 * cross-check first-poweron POCV against live OCV so a stale POR
+	 * snapshot never pins capacity low (e.g. 25%).
 	 */
-	ret = regmap_read(data->regmap, data->base + SC27XX_FGU_POCV, &volt);
-	if (ret)
-		return ret;
+	ret = sc27xx_fgu_get_vbat_ocv(data, &ocv);
+	if (ret || is_first_poweron) {
+		int pocv_ret, pocv;
 
-	volt = sc27xx_fgu_adc_to_voltage(data, volt);
-	ocv = volt * 1000 - oci * data->internal_resist;
+		pocv_ret = regmap_read(data->regmap, data->base + SC27XX_FGU_POCV,
+				       &volt);
+		if (pocv_ret) {
+			if (ret)
+				return pocv_ret;
+		} else {
+			volt = sc27xx_fgu_adc_to_voltage(data, volt);
+			pocv = volt * 1000 - oci * data->internal_resist;
+			if (ret || abs(ocv - pocv) <= 150000)
+				ocv = pocv;
+		}
+	}
+
 	data->boot_volt = ocv;
 
 	/*
@@ -339,24 +352,21 @@ static int sc27xx_fgu_get_boot_capacity(struct sc27xx_fgu_data *data, int *cap)
 					      ocv);
 
 	/*
-	 * If system is not the first power on, we should use the last saved
-	 * battery capacity as the initial battery capacity. Otherwise we should
-	 * use the capacity value calculated above.
+	 * On warm reboot, trust the saved capacity if it agrees within 20% of
+	 * live OCV; otherwise re-anchor near the live OCV estimate instead of
+	 * clinging to a corrupted or stale saved capacity.
 	 */
 	if (!is_first_poweron) {
 		ret = sc27xx_fgu_read_last_cap(data, cap);
 		if (ret)
 			return ret;
 
-		/*
-		 * Limit the saved capacity to a reasonable range based on
-		 * the calculated estimate. This is needed because the saved
-		 * value may be outdated.
-		 */
-		if (*cap < ocv_cap - 5)
-			*cap = ocv_cap - 5;
-		else if (*cap > ocv_cap + 5)
-			*cap = ocv_cap + 5;
+		if (*cap <= 0 || *cap > 100 || abs(*cap - ocv_cap) > 20) {
+			if (*cap < ocv_cap - 5)
+				*cap = max(0, ocv_cap - 5);
+			else if (*cap > ocv_cap + 5)
+				*cap = min(100, ocv_cap + 5);
+		}
 	} else {
 		*cap = ocv_cap;
 	}
@@ -911,6 +921,7 @@ static void sc27xx_fgu_adjust_cap(struct sc27xx_fgu_data *data, int cap)
 	ret = sc27xx_fgu_set_clbcnt(data, data->init_clbcnt);
 	if (ret)
 		dev_err(data->dev, "failed to adjust coulomb counter\n");
+	sc27xx_fgu_save_last_cap(data, cap);
 }
 
 static void sc27xx_fgu_capacity_calibration(struct sc27xx_fgu_data *data,
@@ -939,6 +950,12 @@ static void sc27xx_fgu_capacity_calibration(struct sc27xx_fgu_data *data,
 			sc27xx_fgu_adjust_cap(data, 100);
 		else if (cap < 0)
 			sc27xx_fgu_adjust_cap(data, 0);
+		return;
+	}
+
+	if (chg_sts == POWER_SUPPLY_STATUS_FULL && data->table_len >= 2 &&
+	    ocv >= data->cap_table[1].ocv && cap < 100) {
+		sc27xx_fgu_adjust_cap(data, 100);
 		return;
 	}
 

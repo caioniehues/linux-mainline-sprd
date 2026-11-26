@@ -11,6 +11,7 @@
 #include <linux/mutex.h>
 #include <linux/of_graph.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
 
 #include <drm/clients/drm_client_setup.h>
 #include <drm/drm_atomic_helper.h>
@@ -18,6 +19,7 @@
 #include <drm/drm_fbdev_dma.h>
 #include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_gem_framebuffer_helper.h>
+#include <drm/drm_modeset_helper.h>
 #include <drm/drm_of.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
@@ -218,6 +220,22 @@ static void sprd_drm_shutdown(struct platform_device *pdev)
 	drm_atomic_helper_shutdown(drm);
 }
 
+static int sprd_drm_suspend(struct device *dev)
+{
+	struct drm_device *drm = dev_get_drvdata(dev);
+
+	return drm ? drm_mode_config_helper_suspend(drm) : 0;
+}
+
+static int sprd_drm_resume(struct device *dev)
+{
+	struct drm_device *drm = dev_get_drvdata(dev);
+
+	return drm ? drm_mode_config_helper_resume(drm) : 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(sprd_drm_pm_ops, sprd_drm_suspend, sprd_drm_resume);
+
 static const struct of_device_id drm_match_table[] = {
 	{ .compatible = "sprd,display-subsystem", },
 	{ /* sentinel */ },
@@ -231,6 +249,7 @@ static struct platform_driver sprd_drm_driver = {
 	.driver = {
 		.name = "sprd-drm-drv",
 		.of_match_table = drm_match_table,
+		.pm = pm_sleep_ptr(&sprd_drm_pm_ops),
 	},
 };
 
