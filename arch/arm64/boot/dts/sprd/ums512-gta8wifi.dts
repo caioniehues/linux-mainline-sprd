@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: (GPL-2.0 OR MIT)
 /dts-v1/;
 
 / {
@@ -69,33 +68,23 @@
 			no-map;
 		};
 
-		audio-mem@87500000 {
-			reg = <0x00 0x87500000 0x00 0x300000>;
-			no-map;
-		};
+		/*
+		 * Deduplicated audio-mem@87500000 (subset of audio-mem@87400000)
+		 * and sp-ddr-mem@88000000 (union of smem@88000000 + pmsys@88040000).
+		 * Reclaimed 196.47 MiB of unused Android carveouts:
+		 *   cp-modem@89600000 (85 MiB), hole-mem@8f000000 (11 MiB),
+		 *   faceid-mem@efaae000 (5 MiB), vdsp-mem@f09ae000 (55 MiB),
+		 *   framebuffer-mem@fd708000 (30.35 MiB), writeback-mem@ff562000 (10.12 MiB).
+		 * Validate zero bad pages with tools/ram-scan.py after booting!
+		 */
 
 		sipc-mem@87800000 {
 			reg = <0x00 0x87800000 0x00 0x800000>;
 			no-map;
 		};
 
-		sp-ddr-mem@88000000 {
-			reg = <0x00 0x88000000 0x00 0x300000>;
-			no-map;
-		};
-
 		sipc-ss-mem@88300000 {
 			reg = <0x00 0x88300000 0x00 0x80000>;
-			no-map;
-		};
-
-		cp-modem@89600000 {
-			reg = <0x00 0x89600000 0x00 0x5500000>;
-			no-map;
-		};
-
-		hole-mem@8f000000 {
-			reg = <0x00 0x8f000000 0x00 0xb00000>;
 			no-map;
 		};
 
@@ -146,28 +135,8 @@
 			no-map;
 		};
 
-		faceid-mem@efaae000 {
-			reg = <0x00 0xefaae000 0x00 0x500000>;
-			no-map;
-		};
-
 		protected-mem@effae000 {
 			reg = <0x00 0xeffae000 0x00 0x2000>;
-			no-map;
-		};
-
-		vdsp-mem@f09ae000 {
-			reg = <0x00 0xf09ae000 0x00 0x3700000>;
-			no-map;
-		};
-
-		framebuffer-mem@fd708000 {
-			reg = <0x00 0xfd708000 0x00 0x1e5a000>;
-			no-map;
-		};
-
-		writeback-mem@ff562000 {
-			reg = <0x00 0xff562000 0x00 0xa1e000>;
 			no-map;
 		};
 	};
@@ -535,16 +504,24 @@
 
 		pmsys@800000 {
 			compatible = "sprd,ums512-pmsys";
+			/* LK 0x9f00c880 contract: sprd,name="pmic" + child cproc,name="pm_sys" */
+			sprd,name = "pmic";
 			status = "disabled";
 			reg = <0x00 0x800000 0x00 0x1000>;
 			dma-ranges = <0x18000000 0x00 0x88000000 0x8000000>;
 			#address-cells = <0x01>;
 			#size-cells = <0x01>;
+			ranges = <0x88040000 0x00 0x88040000 0x200000>;
 			sprd,syscon-aon-apb = <0x11>;
 			sprd,syscon-pmu-apb = <0x10>;
 			resets = <0x17 0x08>;
 			memory-region = <0x18>;
 			firmware-name = "sprd/pm_bootcode.bin", "sprd/pm_sys.bin";
+
+			pm-sys@88040000 {
+				cproc,name = "pm_sys";
+				reg = <0x88040000 0x200000>;
+			};
 
 			sipc {
 				#address-cells = <0x01>;
@@ -1255,6 +1232,7 @@
 			#address-cells = <0x01>;
 			#size-cells = <0x01>;
 			ranges = <0x00 0x00 0x60100000 0x3000>;
+			phandle = <0xc9>;
 
 			clock-controller@0 {
 				compatible = "sprd,ums512-gpu-clk";
@@ -1278,10 +1256,12 @@
 			reg = <0x00 0x60000000 0x00 0x100000>;
 			interrupts = <0x00 0x3c 0x04 0x00 0x3c 0x04 0x00 0x3c 0x04>;
 			interrupt-names = "job", "mmu", "gpu";
-			clocks = <0x44 0x01 0x44 0x00 0x44 0x02 0x44 0x04>;
-			clock-names = "core", "gpu", "mem", "bus";
+			clocks = <0x44 0x01 0x44 0x00 0x44 0x02 0x44 0x04 0x44 0x03>;
+			clock-names = "core", "gpu", "mem", "bus", "mem_clk";
 			assigned-clocks = <0x45 0x1d>;
 			assigned-clock-rates = <0x32a9f880>;
+			/* Stock mali_gondul.ko /qos/qos@0: gpu_qos_sel=1 (bit 16) + arqos=6/awqos=6/thresh=f/f -> 0x1ff66 */
+			sprd,gpu-qos-syscon = <0xc9 0x10 0x0001ff66>;
 			power-domains = <0x43 0x0a>;
 			resets = <0x44 0x00>;
 			operating-points-v2 = <0x46>;
@@ -2000,6 +1980,13 @@
 				assigned-clock-parents = <0x72 0x00>;
 				status = "okay";
 				bus-width = <0x04>;
+				/* Stock Samsung X200XXS6DYG6 & upstream ums512-1h10 UHS-I PHY delays */
+				sprd,phy-delay-sd-uhs-sdr104 = <0x7f 0x73 0x72 0x72>;
+				sprd,phy-delay-sd-uhs-sdr50 = <0x6e 0x7f 0x01 0x01>;
+				sprd,phy-delay-sd-highspeed = <0x7f 0x1a 0x9a 0x9a>;
+				sprd,phy-delay-legacy = <0x7f 0x1a 0x9a 0x9a>;
+				sd-uhs-sdr104;
+				sd-uhs-sdr50;
 				no-sdio;
 				no-mmc;
 				cd-gpios = <0x73 0x13 0x00>;
@@ -2274,10 +2261,11 @@
 						phandle = <0xbf>;
 					};
 
-					vibrator@1b90 {
-						compatible = "sprd,sc2730-vibrator";
-						reg = <0x1b90>;
-					};
+					/*
+					 * vibrator@1b90 intentionally omitted (Issue #14): SM-X200 has no
+					 * vibration motor; PMIC LDO VDDVIB (0x1b90, 3.00 V) powers the
+					 * display/touch panel. Never bind sc27xx-vibrator to it.
+					 */
 
 					regulators {
 
