@@ -529,18 +529,29 @@ static int asoc_sprd_card_dai_link_of(struct device_node *node,
 		goto dai_link_of_err1;
 	dai_link->num_cpus = 1;
 
-	ret = asoc_sprd_card_sub_parse_of(codec, &dai_props->codec_dai,
-					  dai_link->codecs, NULL);
-	if (ret < 0) {
-		if (-ENOENT == ret) {
-			pr_info("%s: parse for codec failed. Go to use a dummy codec.\n",
-			     __func__);
-			ret = asoc_sprd_card_dummy_codec_sel(codec, dai_link->codecs);
-			if (ret)
+	if (!of_property_read_u32(codec, "sound-dai", &val) && val != 0 &&
+	    of_count_phandle_with_args(codec, "sound-dai", "#sound-dai-cells") > 1) {
+		dai_link->codecs = NULL;
+		dai_link->num_codecs = 0;
+		ret = snd_soc_of_get_dai_link_codecs(dev, codec, dai_link);
+		if (ret < 0)
+			goto dai_link_of_err1;
+	} else {
+		ret = asoc_sprd_card_sub_parse_of(codec, &dai_props->codec_dai,
+						  dai_link->codecs, NULL);
+		if (ret < 0) {
+			if (-ENOENT == ret) {
+				pr_info("%s: parse for codec failed. Go to use a dummy codec.\n",
+				     __func__);
+				ret = asoc_sprd_card_dummy_codec_sel(codec, dai_link->codecs);
+				if (ret)
+					goto dai_link_of_err1;
+			} else {
 				goto dai_link_of_err1;
+			}
 		}
+		dai_link->num_codecs = 1;
 	}
-	dai_link->num_codecs = 1;
 
 	if (!dai_link->cpus->dai_name || !dai_link->codecs->dai_name) {
 		dev_err(dev, "%s: xx_dai_name is NULL\n", __func__);
@@ -708,9 +719,12 @@ static int asoc_sprd_card_unref(struct snd_soc_card *card)
 	for (num_links = 0, dai_link = card->dai_link;
 	     num_links < card->num_links; num_links++, dai_link++) {
 		if (dai_link->cpus != NULL && dai_link->num_cpus > 0) {
+			int j;
+
 			of_node_put(dai_link->cpus->of_node);
 			of_node_put(dai_link->platforms->of_node);
-			of_node_put(dai_link->codecs->of_node);
+			for (j = 0; j < dai_link->num_codecs; j++)
+				of_node_put(dai_link->codecs[j].of_node);
 		}
 	}
 

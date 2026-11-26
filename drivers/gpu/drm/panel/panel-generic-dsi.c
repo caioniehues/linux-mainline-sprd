@@ -114,6 +114,7 @@ struct generic_panel {
 
     enum drm_panel_orientation orientation;
     bool prepared;
+    bool display_on_sent;
 };
 
 
@@ -520,6 +521,7 @@ static int generic_panel_unprepare(struct drm_panel *panel)
     gpiod_set_value_cansleep(ctx->reset_gpio, 1);
 
     ctx->prepared = false;
+    ctx->display_on_sent = false;
     blocking_notifier_call_chain(&generic_panel_notifier_list,
                                  GENERIC_PANEL_EVENT_UNPREPARED, NULL);
 
@@ -594,6 +596,7 @@ static int generic_panel_prepare(struct drm_panel *panel)
 
     dispon_ret = mipi_dsi_dcs_write_buffer(dsi, display_on, sizeof(display_on));
     dev_info(ctx->dev, "display_on (cmd mode) ret=%d\n", dispon_ret);
+    ctx->display_on_sent = (dispon_ret >= 0);
     msleep(20);
 
     ctx->prepared = true;
@@ -698,7 +701,7 @@ static int generic_panel_enable(struct drm_panel *panel)
     static const u8 display_on[] = { MIPI_DCS_SET_DISPLAY_ON };
     int ret;
 
-    if (skip_init)
+    if (skip_init || ctx->display_on_sent)
         return 0;
 
     ret = mipi_dsi_dcs_write_buffer(dsi, display_on, sizeof(display_on));
