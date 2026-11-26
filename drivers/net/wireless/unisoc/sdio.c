@@ -73,6 +73,8 @@ struct sc23xx_sdio {
 	struct sk_buff_head data_txq;
 	wait_queue_head_t data_tx_wait;
 	struct task_struct *data_tx_thread;
+	/* Use synchronous direct SDIO TX while sdiohal_tx_thread is frozen during suspend/resume. */
+	bool pm_tx_direct;
 };
 
 /*
@@ -135,8 +137,10 @@ static int sc23xx_sdio_tx(int chn, const void *data, u16 len, bool direct)
 
 static int sc23xx_sdio_tx_cmd(struct sc23xx_dev *sdev, struct sk_buff *skb)
 {
+	struct sc23xx_sdio *priv = container_of(sdev, struct sc23xx_sdio, sdev);
+
 	return sc23xx_sdio_tx(SC23XX_SDIO_TX_CMD_PORT, skb->data, skb->len,
-			      false);
+			      READ_ONCE(priv->pm_tx_direct));
 }
 
 /*
@@ -415,7 +419,14 @@ static int sc23xx_sdio_power_notify(int chn, int notify)
 	if (!priv)
 		return 0;
 
+	/*
+	 * dpm_suspend() runs after freezable kthreads (including sdiohal_tx_thread)
+	 * are frozen, and dpm_resume() runs before thaw_processes(). Use the direct
+	 * TX path so the CMD_POWER_SAVE handshake actually goes out over SDIO.
+	 */
+	WRITE_ONCE(priv->pm_tx_direct, true);
 	ret = sc23xx_set_suspend(&priv->sdev, suspend);
+	WRITE_ONCE(priv->pm_tx_direct, false);
 	if (ret)
 		dev_warn(&priv->pdev->dev,
 			 "chn %d %s handshake failed: %d\n", chn,

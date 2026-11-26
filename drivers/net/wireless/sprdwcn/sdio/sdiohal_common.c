@@ -290,14 +290,17 @@ void sdiohal_unlock_tx_ws(void)
 {
 	struct sdiohal_data_t *p_data = sdiohal_get_data();
 
+	if (atomic_read(&p_data->tx_wake_flag) <= 0)
+		goto clear_pm_seltx;
+
 	sdiohal_atomic_sub(1, &p_data->tx_wake_flag);
 	if (atomic_read(&p_data->tx_wake_flag))
-            goto clear_pm_seltx;
+		goto clear_pm_seltx;
 
 	__pm_relax(p_data->tx_ws);
 
 clear_pm_seltx:
-    atomic_andnot(BIT(SDIOHAL_PM_SEL_TX), &p_data->pm_sel);
+	atomic_andnot(BIT(SDIOHAL_PM_SEL_TX), &p_data->pm_sel);
 }
 
 void sdiohal_lock_rx_ws(void)
