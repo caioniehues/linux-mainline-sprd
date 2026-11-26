@@ -5,20 +5,27 @@
 
 #include <linux/component.h>
 #include <linux/dma-mapping.h>
+#include <linux/iommu.h>
+#include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of_graph.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
 
+#include <drm/clients/drm_client_setup.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_drv.h>
+#include <drm/drm_fbdev_dma.h>
 #include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_gem_framebuffer_helper.h>
+#include <drm/drm_modeset_helper.h>
 #include <drm/drm_of.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
 
 #include "sprd_drm.h"
+#include "sprd_gem.h"
 
 #define DRIVER_NAME	"sprd"
 #define DRIVER_DESC	"Spreadtrum SoCs' DRM Driver"
@@ -53,13 +60,59 @@ static struct drm_driver sprd_drm_drv = {
 	.fops			= &sprd_drm_fops,
 
 	/* GEM Operations */
-	DRM_GEM_DMA_DRIVER_OPS,
+	.dumb_create		= sprd_gem_dumb_create,
+	.gem_prime_import_sg_table = sprd_gem_prime_import_sg_table,
+
+	DRM_FBDEV_DMA_DRIVER_OPS,
 
 	.name			= DRIVER_NAME,
 	.desc			= DRIVER_DESC,
 	.major			= DRIVER_MAJOR,
 	.minor			= DRIVER_MINOR,
 };
+
+int sprd_drm_iommu_attach(struct drm_device *drm, struct device *dpu_dev)
+{
+	struct sprd_drm *sprd = to_sprd_drm(drm);
+	struct iommu_domain_geometry *geometry;
+	int ret;
+
+	if (!sprd->iommu_domain) {
+		sprd->iommu_domain = iommu_paging_domain_alloc(dpu_dev);
+		if (IS_ERR(sprd->iommu_domain)) {
+			ret = PTR_ERR(sprd->iommu_domain);
+			sprd->iommu_domain = NULL;
+			return ret;
+		}
+
+		geometry = &sprd->iommu_domain->geometry;
+
+		drm_mm_init(&sprd->mm, geometry->aperture_start,
+			    geometry->aperture_end -
+			    geometry->aperture_start + 1);
+		mutex_init(&sprd->mm_lock);
+	}
+
+	return iommu_attach_device(sprd->iommu_domain, dpu_dev);
+}
+
+void sprd_drm_iommu_detach(struct drm_device *drm, struct device *dpu_dev)
+{
+	struct sprd_drm *sprd = to_sprd_drm(drm);
+
+	if (sprd->iommu_domain)
+		iommu_detach_device(sprd->iommu_domain, dpu_dev);
+}
+
+static void sprd_drm_iommu_cleanup(struct sprd_drm *sprd)
+{
+	if (!sprd->iommu_domain)
+		return;
+
+	mutex_destroy(&sprd->mm_lock);
+	drm_mm_takedown(&sprd->mm);
+	iommu_domain_free(sprd->iommu_domain);
+}
 
 static int sprd_drm_bind(struct device *dev)
 {
@@ -88,6 +141,16 @@ static int sprd_drm_bind(struct device *dev)
 		return ret;
 	}
 
+	/*
+	 * FIXME: sprd_gem_prime_import_sg_table() manages the IOMMU mapping,
+	 * so any additional DMA mapping in dma_buf_map_attachment() is
+	 * unnecessary when an IOMMU is in use. Since we cannot control this
+	 * here, set a fake DMA mask to avoid bouncing via swiotlb. This should
+	 * ideally match the address size supported by the IOMMU.
+	 */
+	if (sprd->iommu_domain)
+		dma_set_mask_and_coherent(drm->dev, DMA_BIT_MASK(44));
+
 	/* vblank init */
 	ret = drm_vblank_init(drm, drm->mode_config.num_crtc);
 	if (ret) {
@@ -105,12 +168,15 @@ static int sprd_drm_bind(struct device *dev)
 	if (ret < 0)
 		goto err_kms_helper_poll_fini;
 
+	drm_client_setup(drm, NULL);
+
 	return 0;
 
 err_kms_helper_poll_fini:
 	drm_kms_helper_poll_fini(drm);
 err_unbind_all:
 	component_unbind_all(drm->dev, drm);
+	sprd_drm_iommu_cleanup(sprd);
 	return ret;
 }
 
@@ -123,6 +189,8 @@ static void sprd_drm_unbind(struct device *dev)
 	drm_kms_helper_poll_fini(drm);
 
 	component_unbind_all(drm->dev, drm);
+
+	sprd_drm_iommu_cleanup(to_sprd_drm(drm));
 }
 
 static const struct component_master_ops drm_component_ops = {
@@ -130,9 +198,17 @@ static const struct component_master_ops drm_component_ops = {
 	.unbind = sprd_drm_unbind,
 };
 
+static int sprd_drm_compare_of(struct device *dev, void *data)
+{
+	struct device_node *np = data;
+
+	return dev->of_node == np ||
+	       (of_node_name_eq(np, "port") && dev->of_node == np->parent);
+}
+
 static int sprd_drm_probe(struct platform_device *pdev)
 {
-	return drm_of_component_probe(&pdev->dev, component_compare_of, &drm_component_ops);
+	return drm_of_component_probe(&pdev->dev, sprd_drm_compare_of, &drm_component_ops);
 }
 
 static void sprd_drm_remove(struct platform_device *pdev)
@@ -152,6 +228,22 @@ static void sprd_drm_shutdown(struct platform_device *pdev)
 	drm_atomic_helper_shutdown(drm);
 }
 
+static int sprd_drm_suspend(struct device *dev)
+{
+	struct drm_device *drm = dev_get_drvdata(dev);
+
+	return drm ? drm_mode_config_helper_suspend(drm) : 0;
+}
+
+static int sprd_drm_resume(struct device *dev)
+{
+	struct drm_device *drm = dev_get_drvdata(dev);
+
+	return drm ? drm_mode_config_helper_resume(drm) : 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(sprd_drm_pm_ops, sprd_drm_suspend, sprd_drm_resume);
+
 static const struct of_device_id drm_match_table[] = {
 	{ .compatible = "sprd,display-subsystem", },
 	{ /* sentinel */ },
@@ -165,6 +257,7 @@ static struct platform_driver sprd_drm_driver = {
 	.driver = {
 		.name = "sprd-drm-drv",
 		.of_match_table = drm_match_table,
+		.pm = pm_sleep_ptr(&sprd_drm_pm_ops),
 	},
 };
 

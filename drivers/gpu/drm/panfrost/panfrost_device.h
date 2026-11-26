@@ -137,6 +137,11 @@ struct panfrost_device {
 	struct clk *clock;
 	struct clk *bus_clock;
 	struct clk *bus_ace_clock;
+	struct clk *mem_clock;
+	struct clk *mem_freq_clock;
+	struct regmap *qos_syscon;
+	u32 qos_offset;
+	u32 qos_val;
 	struct regulator_bulk_data *regulators;
 	struct reset_control *rstc;
 	/* pm_domains for devices with more than one. */

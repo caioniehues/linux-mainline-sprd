@@ -28,7 +28,6 @@ struct sprd_pcm_dma_data {
 
 struct sprd_pcm_dma_private {
 	struct snd_pcm_substream *substream;
-	struct sprd_pcm_dma_params *params;
 	struct sprd_pcm_dma_data data[SPRD_PCM_CHANNEL_MAX];
 	int hw_chan;
 	int dma_addr_offset;
@@ -36,8 +35,9 @@ struct sprd_pcm_dma_private {
 
 static const struct snd_pcm_hardware sprd_pcm_hardware = {
 	.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
-		SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_PAUSE |
-		SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_NO_PERIOD_WAKEUP,
+		SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_NONINTERLEAVED |
+		SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_RESUME |
+		SNDRV_PCM_INFO_NO_PERIOD_WAKEUP,
 	.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_LE,
 	.period_bytes_min = 1,
 	.period_bytes_max = 64 * 1024,
@@ -155,12 +155,12 @@ static void sprd_pcm_release_dma_channel(struct snd_pcm_substream *substream)
 
 static int sprd_pcm_request_dma_channel(struct snd_soc_component *component,
 					struct snd_pcm_substream *substream,
+					struct sprd_pcm_dma_params *dma_params,
 					int channels)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct sprd_pcm_dma_private *dma_private = runtime->private_data;
 	struct device *dev = component->dev;
-	struct sprd_pcm_dma_params *dma_params = dma_private->params;
 	int i;
 
 	if (channels > SPRD_PCM_CHANNEL_MAX) {
@@ -203,17 +203,27 @@ static int sprd_pcm_hw_params(struct snd_soc_component *component,
 	dma_params = snd_soc_dai_get_dma_data(snd_soc_rtd_to_cpu(rtd, 0), substream);
 	if (!dma_params) {
 		dev_warn(component->dev, "no dma parameters setting\n");
-		dma_private->params = NULL;
 		return 0;
 	}
 
-	if (!dma_private->params) {
-		dma_private->params = dma_params;
-		ret = sprd_pcm_request_dma_channel(component,
-						   substream, channels);
-		if (ret)
-			return ret;
+	/*
+	 * In interleaved mode, all audio channels are passed through a single
+	 * DMA channel. Whether interleaved mode is used or not depends on the
+	 * constaints set by the CPU DAI.
+	 */
+	switch (params_access(params)) {
+	case SNDRV_PCM_ACCESS_MMAP_INTERLEAVED:
+	case SNDRV_PCM_ACCESS_RW_INTERLEAVED:
+		channels = 1;
+		break;
+	default:
+		break;
 	}
+
+	ret = sprd_pcm_request_dma_channel(component, substream, dma_params,
+					   channels);
+	if (ret)
+		return ret;
 
 	sg_num = totsize / period;
 	dma_private->dma_addr_offset = totsize / channels;
@@ -469,6 +479,8 @@ static int sprd_soc_platform_probe(struct platform_device *pdev)
 
 	ret = devm_snd_soc_register_component(&pdev->dev, &sprd_soc_component,
 					      NULL, 0);
+	if (ret)
+		dev_err(&pdev->dev, "could not register platform:%d\n", ret);
 
 	return ret;
 }

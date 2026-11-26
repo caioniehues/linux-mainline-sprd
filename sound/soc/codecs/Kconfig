@@ -59,6 +59,7 @@ config SND_SOC_ALL_CODECS
 	imply SND_SOC_AW88081
 	imply SND_SOC_AW88166
 	imply SND_SOC_AW88261
+	imply SND_SOC_AW88266
 	imply SND_SOC_AW88399
 	imply SND_SOC_BT_SCO
 	imply SND_SOC_BD28623
@@ -248,6 +249,7 @@ config SND_SOC_ALL_CODECS
 	imply SND_SOC_RT9123
 	imply SND_SOC_RTQ9124
 	imply SND_SOC_RTQ9128
+	imply SND_SOC_SC2730
 	imply SND_SOC_SDW_MOCKUP
 	imply SND_SOC_SGTL5000
 	imply SND_SOC_SI476X
@@ -303,6 +305,7 @@ config SND_SOC_ALL_CODECS
 	imply SND_SOC_UDA1334
 	imply SND_SOC_UDA1342
 	imply SND_SOC_UDA1380
+	imply SND_SOC_UMS9230_DIGITAL
 	imply SND_SOC_WCD9335
 	imply SND_SOC_WCD934X
 	imply SND_SOC_WCD937X_SDW
@@ -705,6 +708,15 @@ config SND_SOC_AW88261
 	  digital Smart K audio amplifier. The output voltage of
 	  boost converter can be adjusted smartly according to
 	  the input amplitude.
+
+config SND_SOC_AW88266
+	tristate "Soc Audio for awinic aw88266a"
+	depends on I2C
+	select REGMAP_I2C
+	select GPIOLIB
+	help
+	  Say Y or M to enable support for the Awinic AW88266A (PID 0x2013)
+	  Smart PA digital audio amplifier.
 
 config SND_SOC_AW88081
 	tristate "Soc Audio for awinic aw88081/aw88083"
@@ -2037,6 +2049,13 @@ config SND_SOC_RTQ9128
 	  To compile this driver as a module, choose M here: the module
 	  will be called snd-soc-rtq9128.
 
+config SND_SOC_SC2730
+	tristate "Spreadtrum SC2730 PMIC codec"
+	depends on MFD_SC27XX_PMIC || COMPILE_TEST
+	help
+	  This driver provides support for the integrated audio codec in
+	  the SC2730 PMIC.
+
 config SND_SOC_SDW_MOCKUP
 	tristate "SoundWire mockup codec"
 	depends on EXPERT
@@ -2429,6 +2448,11 @@ config SND_SOC_UDA1380
 	help
 	  The UDA1380 codec is used in the HTC Magician and on a number of
 	  Samsung reference boards, as well as the LPC32xx series.
+
+config SND_SOC_UMS9230_DIGITAL
+	tristate "UMS9230 Digital Codec"
+	depends on ARCH_SPRD || COMPILE_TEST
+	depends on REGMAP_MMIO
 
 config SND_SOC_WCD_CLASSH
 	tristate

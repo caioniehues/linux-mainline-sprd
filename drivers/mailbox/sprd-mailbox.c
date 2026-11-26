@@ -377,8 +377,10 @@ static int sprd_mbox_probe(struct platform_device *pdev)
 
 	ret = devm_request_irq(dev, inbox_irq, sprd_mbox_inbox_isr,
 			       IRQF_NO_SUSPEND, dev_name(dev), priv);
-	if (ret)
+	if (ret) {
+		dev_err(dev, "failed to request inbox IRQ: %d\n", ret);
 		return ret;
+	}
 
 	outbox_irq = platform_get_irq_byname(pdev, "outbox");
 	if (outbox_irq < 0)
@@ -386,16 +388,20 @@ static int sprd_mbox_probe(struct platform_device *pdev)
 
 	ret = devm_request_irq(dev, outbox_irq, sprd_mbox_outbox_isr,
 			       IRQF_NO_SUSPEND, dev_name(dev), priv);
-	if (ret)
+	if (ret) {
+		dev_err(dev, "failed to request outbox IRQ: %d\n", ret);
 		return ret;
+	}
 
 	/* Supplementary outbox IRQ is optional */
 	supp_irq = platform_get_irq_byname(pdev, "supp-outbox");
 	if (supp_irq > 0) {
 		ret = devm_request_irq(dev, supp_irq, sprd_mbox_supp_isr,
 				       IRQF_NO_SUSPEND, dev_name(dev), priv);
-		if (ret)
+		if (ret) {
+			dev_err(dev, "failed to request outbox IRQ: %d\n", ret);
 			return ret;
+		}
 
 		if (!priv->info->supp_id) {
 			dev_err(dev, "no supplementary outbox specified\n");
@@ -444,10 +450,16 @@ static const struct sprd_mbox_info ums9230_mbox_info = {
 	.supp_id = 6,
 };
 
+static const struct sprd_mbox_info ums512_mbox_info = {
+    .version = SPRD_MBOX_R1,
+    .supp_id = 6,
+};
+
 static const struct of_device_id sprd_mbox_of_match[] = {
 	{ .compatible = "sprd,sc9860-mailbox", .data = &sc9860_mbox_info },
 	{ .compatible = "sprd,sc9863a-mailbox", .data = &sc9863a_mbox_info },
 	{ .compatible = "sprd,ums9230-mailbox", .data = &ums9230_mbox_info },
+	{ .compatible = "sprd,ums512-mailbox", .data = &ums512_mbox_info },
 	{ },
 };
 MODULE_DEVICE_TABLE(of, sprd_mbox_of_match);

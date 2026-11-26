@@ -3,31 +3,35 @@
  * Copyright (C) 2020 Unisoc Inc.
  */
 
+#include <linux/clk.h>
 #include <linux/component.h>
 #include <linux/delay.h>
 #include <linux/dma-buf.h>
 #include <linux/io.h>
+#include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_graph.h>
 #include <linux/platform_device.h>
+#include <linux/regmap.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_blend.h>
-#include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_framebuffer.h>
-#include <drm/drm_gem_dma_helper.h>
-#include <drm/drm_gem_framebuffer_helper.h>
 
 #include "sprd_drm.h"
 #include "sprd_dpu.h"
 #include "sprd_dsi.h"
+#include "sprd_gem.h"
 
 /* Global control registers */
+#define REG_DPU_VERSION	0x00
 #define REG_DPU_CTRL	0x04
 #define REG_DPU_CFG0	0x08
+#define REG_DPU_CFG1	0x0C
+#define REG_DPU_CFG2	0x10
 #define REG_PANEL_SIZE	0x20
 #define REG_BLEND_SIZE	0x24
 #define REG_BG_COLOR	0x2C
@@ -52,14 +56,6 @@
 #define REG_DPI_CTRL		0x1F0
 #define REG_DPI_H_TIMING	0x1F4
 #define REG_DPI_V_TIMING	0x1F8
-
-/* MMU control registers */
-#define REG_MMU_EN			0x800
-#define REG_MMU_VPN_RANGE		0x80C
-#define REG_MMU_PPN1			0x83C
-#define REG_MMU_RANGE1			0x840
-#define REG_MMU_PPN2			0x844
-#define REG_MMU_RANGE2			0x848
 
 /* Global control bits */
 #define BIT_DPU_RUN			BIT(0)
@@ -120,6 +116,36 @@ static const u32 layer_fmts[] = {
 	DRM_FORMAT_YUV420,
 	DRM_FORMAT_YVU420,
 };
+
+static bool dpi_halt = true;
+module_param(dpi_halt, bool, 0644);
+MODULE_PARM_DESC(dpi_halt, "Enable DPU DPI halt handshake on DPU >= r3p0");
+
+static unsigned int dpi_clk_khz;
+module_param(dpi_clk_khz, uint, 0644);
+MODULE_PARM_DESC(dpi_clk_khz, "Override DPI pixel clock in kHz when setting rate (0 = mode clock)");
+
+static bool dpi_clk_set_rate;
+module_param(dpi_clk_set_rate, bool, 0644);
+MODULE_PARM_DESC(dpi_clk_set_rate, "Force clk_set_rate on dpi clock even when sprd,dpi-clk-div is set");
+
+static int __init sprd_dpu_dpi_halt_setup(char *s)
+{
+	return kstrtobool(s, &dpi_halt) == 0;
+}
+__setup("sprd_dpu.dpi_halt=", sprd_dpu_dpi_halt_setup);
+
+static int __init sprd_dpu_dpi_clk_khz_setup(char *s)
+{
+	return kstrtouint(s, 0, &dpi_clk_khz) == 0;
+}
+__setup("sprd_dpu.dpi_clk_khz=", sprd_dpu_dpi_clk_khz_setup);
+
+static int __init sprd_dpu_dpi_clk_set_rate_setup(char *s)
+{
+	return kstrtobool(s, &dpi_clk_set_rate) == 0;
+}
+__setup("sprd_dpu.dpi_clk_set_rate=", sprd_dpu_dpi_clk_set_rate_setup);
 
 struct sprd_plane {
 	struct drm_plane base;
@@ -320,7 +346,7 @@ static u32 drm_blend_to_dpu(struct drm_plane_state *state)
 static void sprd_dpu_layer(struct sprd_dpu *dpu, struct drm_plane_state *state)
 {
 	struct dpu_context *ctx = &dpu->ctx;
-	struct drm_gem_dma_object *dma_obj;
+	struct sprd_gem_obj *sprd_gem;
 	struct drm_framebuffer *fb = state->fb;
 	u32 addr, size, offset, pitch, blend, format, rotation;
 	u32 src_x = state->src_x >> 16;
@@ -331,14 +357,15 @@ static void sprd_dpu_layer(struct sprd_dpu *dpu, struct drm_plane_state *state)
 	u32 dst_y = state->crtc_y;
 	u32 alpha = state->alpha;
 	u32 index = state->zpos;
+	static int dump_count;
 	int i;
 
 	offset = (dst_x & 0xffff) | (dst_y << 16);
 	size = (src_w & 0xffff) | (src_h << 16);
 
 	for (i = 0; i < fb->format->num_planes; i++) {
-		dma_obj = drm_fb_dma_get_gem_obj(fb, i);
-		addr = dma_obj->dma_addr + fb->offsets[i];
+		sprd_gem = to_sprd_gem_obj(fb->obj[i]);
+		addr = sprd_gem->dma_addr + fb->offsets[i];
 
 		if (i == 0)
 			layer_reg_wr(ctx, REG_LAY_BASE_ADDR0, addr, index);
@@ -367,6 +394,14 @@ static void sprd_dpu_layer(struct sprd_dpu *dpu, struct drm_plane_state *state)
 	blend = drm_blend_to_dpu(state);
 	rotation = drm_rotation_to_dpu(state);
 
+	if (dump_count < 6) {
+		dump_count++;
+		drm_info(dpu->drm,
+			 "LAYDUMP[%d] idx=%u base=%08x size=%08x pitch=%u fmt=%08x num_planes=%u\n",
+			 dump_count, index, addr, size, pitch, format,
+			 fb->format->num_planes);
+	}
+
 	layer_reg_wr(ctx, REG_LAY_CTRL, BIT_DPU_LAY_EN |
 				format |
 				blend |
@@ -377,6 +412,27 @@ static void sprd_dpu_layer(struct sprd_dpu *dpu, struct drm_plane_state *state)
 static void sprd_dpu_flip(struct sprd_dpu *dpu)
 {
 	struct dpu_context *ctx = &dpu->ctx;
+	static int dump_count;
+
+	if (dump_count < 4) {
+		dump_count++;
+		drm_info(dpu->drm,
+			 "DPUDUMP[%d] stopped=%d CTRL=%08x INT_EN=%08x INT_STS=%08x DPI_CTRL=%08x\n",
+			 dump_count, ctx->stopped,
+			 readl(ctx->base + REG_DPU_CTRL),
+			 readl(ctx->base + REG_DPU_INT_EN),
+			 readl(ctx->base + REG_DPU_INT_STS),
+			 readl(ctx->base + REG_DPI_CTRL));
+		drm_info(dpu->drm,
+			 "DPUDUMP[%d] PANEL=%08x LAY_CTRL=%08x LAY_SIZE=%08x LAY_PITCH=%08x LAY_BASE0=%08x LAY_POS=%08x\n",
+			 dump_count,
+			 readl(ctx->base + REG_PANEL_SIZE),
+			 readl(ctx->base + REG_LAY_CTRL),
+			 readl(ctx->base + REG_LAY_SIZE),
+			 readl(ctx->base + REG_LAY_PITCH),
+			 readl(ctx->base + REG_LAY_BASE_ADDR0),
+			 readl(ctx->base + REG_LAY_POS));
+	}
 
 	/*
 	 * Make sure the dpu is in stop status. DPU has no shadow
@@ -391,6 +447,10 @@ static void sprd_dpu_flip(struct sprd_dpu *dpu)
 		if (!ctx->stopped) {
 			dpu_reg_set(ctx, REG_DPU_CTRL, BIT_DPU_REG_UPDATE);
 			dpu_wait_update_done(dpu);
+		} else {
+			dpu_reg_set(ctx, REG_DPU_CTRL, BIT_DPU_RUN);
+			dpu_reg_set(ctx, REG_DPU_CTRL, BIT_DPU_REG_UPDATE);
+			ctx->stopped = false;
 		}
 
 		dpu_reg_set(ctx, REG_DPU_INT_EN, BIT_DPU_INT_ERR);
@@ -401,26 +461,92 @@ static void sprd_dpu_flip(struct sprd_dpu *dpu)
 	}
 }
 
+static void sprd_dpu_reset(struct dpu_context *ctx)
+{
+	if (!ctx->rst_syscon)
+		return;
+
+	regmap_update_bits(ctx->rst_syscon, ctx->rst_offset,
+			   ctx->rst_mask, ctx->rst_mask);
+	udelay(10);
+	regmap_update_bits(ctx->rst_syscon, ctx->rst_offset,
+			   ctx->rst_mask, 0);
+	udelay(10);
+
+	/*
+	 * The DPU is now in a clean, stopped state. Mark it so that the
+	 * follow-up sprd_dpu_init() skips sprd_dpu_stop() - issuing STOP on a
+	 * freshly-reset DPU just times out waiting for a stop-done IRQ and
+	 * leaves it unable to start.
+	 */
+	ctx->stopped = true;
+}
+
+static void sprd_dpi_init(struct sprd_dpu *dpu);
+
 static void sprd_dpu_init(struct sprd_dpu *dpu)
 {
 	struct dpu_context *ctx = &dpu->ctx;
 	u32 int_mask = 0;
+	u32 dpu_version;
+
+	/*
+	 * On sharkl5pro the DPU core clock is not selected by the CLK_DISPC0
+	 * mux but by the AP DVFS block: a table of operating points and one
+	 * work index for the display. The index resets to 0 (153.6 MHz). A
+	 * pixel clock above that (166 MHz on the Galaxy Tab A8) drains the
+	 * DPI FIFO on the first active line of every frame: an underflow per
+	 * frame and no picture. Select the board's operating point before the
+	 * DPU runs. The vendor kernel does this in its dpu-dvfs driver.
+	 */
+	if (ctx->dvfs_syscon)
+		regmap_write(ctx->dvfs_syscon, ctx->dvfs_offset, ctx->dvfs_index);
+
+	/* clear the bootloader's pinned state so our config can latch */
+	sprd_dpu_reset(ctx);
+
+	/*
+	 * The reset above wipes every DPU register, including the panel size
+	 * and DPI timing that sprd_dpi_init() programmed in mode_set_nofb
+	 * (which runs before this atomic_enable). Re-apply them here, after the
+	 * reset, or the DPU runs with PANEL_SIZE=0 / DPI timing=0 and can never
+	 * complete a frame (reg update done timeout, underflow, black screen).
+	 */
+	sprd_dpi_init(dpu);
+
+	dpu_version = readl(ctx->base + REG_DPU_VERSION);
 
 	writel(0x00, ctx->base + REG_BG_COLOR);
-	writel(0x00, ctx->base + REG_MMU_EN);
-	writel(0x00, ctx->base + REG_MMU_PPN1);
-	writel(0xffff, ctx->base + REG_MMU_RANGE1);
-	writel(0x00, ctx->base + REG_MMU_PPN2);
-	writel(0xffff, ctx->base + REG_MMU_RANGE2);
-	writel(0x1ffff, ctx->base + REG_MMU_VPN_RANGE);
+
+	if (ctx->qos_syscon)
+		regmap_update_bits(ctx->qos_syscon, ctx->qos_offset,
+				   ctx->qos_mask, ctx->qos_val);
+
+	/*
+	 * DDR QoS (CFG1) and CFG2. Without the QoS priorities the DPU's DDR
+	 * read requests starve and the layer FIFO underflows on the first
+	 * frame (no vsync). Values from the vendor dpu-r4p0 driver:
+	 * awqos_high=0xa awqos_low=0xa arqos_high=0xd arqos_low=0xc | BIT18 | BIT22.
+	 */
+	writel((0xa << 12) | (0xa << 8) | (0xd << 4) | 0xc | BIT(18) | BIT(22),
+	       ctx->base + REG_DPU_CFG1);
+	writel(0x14002, ctx->base + REG_DPU_CFG2);
 
 	if (ctx->if_type == SPRD_DPU_IF_DPI) {
 		/* use dpi as interface */
 		dpu_reg_clr(ctx, REG_DPU_CFG0, BIT_DPU_IF_EDPI);
-		/* disable Halt function for SPRD DSI */
-		dpu_reg_clr(ctx, REG_DPI_CTRL, BIT_DPU_DPI_HALT_EN);
-		/* select te from external pad */
-		dpu_reg_set(ctx, REG_DPI_CTRL, BIT_DPU_EDPI_FROM_EXTERNAL_PAD);
+
+		if (dpu_version < 0x300) {
+			/* disable Halt function for SPRD DSI */
+			dpu_reg_clr(ctx, REG_DPI_CTRL, BIT_DPU_DPI_HALT_EN);
+			/* select te from external pad */
+			dpu_reg_set(ctx, REG_DPI_CTRL, BIT_DPU_EDPI_FROM_EXTERNAL_PAD);
+		} else {
+			if (dpi_halt)
+				dpu_reg_set(ctx, REG_DPI_CTRL, BIT_DPU_DPI_HALT_EN);
+			else
+				dpu_reg_clr(ctx, REG_DPI_CTRL, BIT_DPU_DPI_HALT_EN);
+		}
 
 		/* enable dpu update done INT */
 		int_mask |= BIT_DPU_INT_UPDATE_DONE;
@@ -447,6 +573,14 @@ static void sprd_dpu_init(struct sprd_dpu *dpu)
 	}
 
 	writel(int_mask, ctx->base + REG_DPU_INT_EN);
+
+	/*
+	 * The DPU is usually enabled by the bootloader to show
+	 * a splash screen. Stop it here when the kernel initializes
+	 * the display.
+	 */
+	if (!ctx->stopped)
+		sprd_dpu_stop(dpu);
 }
 
 static void sprd_dpu_fini(struct sprd_dpu *dpu)
@@ -455,6 +589,51 @@ static void sprd_dpu_fini(struct sprd_dpu *dpu)
 
 	writel(0x00, ctx->base + REG_DPU_INT_EN);
 	writel(0xff, ctx->base + REG_DPU_INT_CLR);
+}
+
+/*
+ * Gate the DPU clocks while the CRTC is off, as the vendor driver does:
+ * with CLK_DISPC_EB left on AP_SYS never reaches deep sleep. Nothing may
+ * touch DPU registers while !powered.
+ */
+static int sprd_dpu_clk_on(struct dpu_context *ctx)
+{
+	int ret;
+
+	if (ctx->powered)
+		return 0;
+
+	ret = clk_prepare_enable(ctx->clk);
+	if (ret)
+		return ret;
+
+	ret = clk_prepare_enable(ctx->pipe_clk);
+	if (ret)
+		goto err_core;
+
+	ret = clk_prepare_enable(ctx->dpi_clk);
+	if (ret)
+		goto err_pipe;
+
+	ctx->powered = true;
+	return 0;
+
+err_pipe:
+	clk_disable_unprepare(ctx->pipe_clk);
+err_core:
+	clk_disable_unprepare(ctx->clk);
+	return ret;
+}
+
+static void sprd_dpu_clk_off(struct dpu_context *ctx)
+{
+	if (!ctx->powered)
+		return;
+
+	clk_disable_unprepare(ctx->dpi_clk);
+	clk_disable_unprepare(ctx->pipe_clk);
+	clk_disable_unprepare(ctx->clk);
+	ctx->powered = false;
 }
 
 static void sprd_dpi_init(struct sprd_dpu *dpu)
@@ -486,6 +665,7 @@ void sprd_dpu_run(struct sprd_dpu *dpu)
 	struct dpu_context *ctx = &dpu->ctx;
 
 	dpu_reg_set(ctx, REG_DPU_CTRL, BIT_DPU_RUN);
+	dpu_reg_set(ctx, REG_DPU_CTRL, BIT_DPU_REG_UPDATE);
 
 	ctx->stopped = false;
 }
@@ -494,10 +674,47 @@ void sprd_dpu_stop(struct sprd_dpu *dpu)
 {
 	struct dpu_context *ctx = &dpu->ctx;
 
+	if (!ctx->powered)
+		return;
+
 	if (ctx->if_type == SPRD_DPU_IF_DPI)
 		dpu_reg_set(ctx, REG_DPU_CTRL, BIT_DPU_STOP);
 
 	dpu_wait_stop_done(dpu);
+}
+
+void sprd_dpu_halt(struct sprd_dpu *dpu)
+{
+	struct dpu_context *ctx = &dpu->ctx;
+
+	writel(0x00, ctx->base + REG_DPU_INT_EN);
+	writel(0xff, ctx->base + REG_DPU_INT_CLR);
+
+	if (ctx->rst_syscon) {
+		sprd_dpu_reset(ctx);
+	} else {
+		dpu_reg_set(ctx, REG_DPU_CTRL, BIT_DPU_STOP);
+		ctx->stopped = true;
+	}
+
+	drm_info(dpu->drm, "dpu halted: CTRL=0x%08x INT_EN=0x%08x DPI_CTRL=0x%08x\n",
+		 readl(ctx->base + REG_DPU_CTRL),
+		 readl(ctx->base + REG_DPU_INT_EN),
+		 readl(ctx->base + REG_DPI_CTRL));
+}
+
+void sprd_dpu_dump_state(struct sprd_dpu *dpu, const char *tag)
+{
+	struct dpu_context *ctx = &dpu->ctx;
+
+	drm_info(dpu->drm,
+		 "%s DPU: stopped=%d CTRL=0x%08x CFG0=0x%08x INT_EN=0x%08x INT_STS=0x%08x DPI_CTRL=0x%08x\n",
+		 tag, ctx->stopped,
+		 readl(ctx->base + REG_DPU_CTRL),
+		 readl(ctx->base + REG_DPU_CFG0),
+		 readl(ctx->base + REG_DPU_INT_EN),
+		 readl(ctx->base + REG_DPU_INT_STS),
+		 readl(ctx->base + REG_DPI_CTRL));
 }
 
 static int sprd_plane_atomic_check(struct drm_plane *plane,
@@ -532,6 +749,9 @@ static void sprd_plane_atomic_update(struct drm_plane *drm_plane,
 									   drm_plane);
 	struct sprd_dpu *dpu = to_sprd_crtc(new_state->crtc);
 
+	if (!dpu->ctx.powered)
+		return;
+
 	/* start configure dpu layers */
 	sprd_dpu_layer(dpu, new_state);
 }
@@ -542,6 +762,9 @@ static void sprd_plane_atomic_disable(struct drm_plane *drm_plane,
 	struct drm_plane_state *old_state = drm_atomic_get_old_plane_state(state,
 									   drm_plane);
 	struct sprd_dpu *dpu = to_sprd_crtc(old_state->crtc);
+
+	if (!dpu->ctx.powered)
+		return;
 
 	layer_reg_wr(&dpu->ctx, REG_LAY_CTRL, 0x00, old_state->zpos);
 }
@@ -577,7 +800,6 @@ static const struct drm_plane_helper_funcs sprd_plane_helper_funcs = {
 static const struct drm_plane_funcs sprd_plane_funcs = {
 	.update_plane = drm_atomic_helper_update_plane,
 	.disable_plane	= drm_atomic_helper_disable_plane,
-	.destroy = drm_plane_cleanup,
 	.reset = drm_atomic_helper_plane_reset,
 	.atomic_duplicate_state = drm_atomic_helper_plane_duplicate_state,
 	.atomic_destroy_state = drm_atomic_helper_plane_destroy_state,
@@ -632,13 +854,37 @@ static void sprd_crtc_mode_set_nofb(struct drm_crtc *crtc)
 			dpu->ctx.if_type = SPRD_DPU_IF_EDPI;
 	}
 
-	sprd_dpi_init(dpu);
+	if (dpu->ctx.dpi_clk) {
+		if (dpu->ctx.dpi_clk_fixed) {
+			drm_info(dpu->drm, "dpi pixel clock fixed (div=%u, rate=%lu Hz)\n",
+				 dpu->ctx.dpi_clk_div, clk_get_rate(dpu->ctx.dpi_clk));
+		} else {
+			unsigned long wanted = dpi_clk_khz ?
+				(unsigned long)dpi_clk_khz * 1000UL :
+				(unsigned long)mode->clock * 1000UL;
+			long rounded = clk_round_rate(dpu->ctx.dpi_clk, wanted);
+
+			if (rounded > 0)
+				clk_set_rate(dpu->ctx.dpi_clk, rounded);
+			drm_info(dpu->drm, "dpi pixel clock wanted=%lu actual=%lu Hz\n",
+				 wanted, clk_get_rate(dpu->ctx.dpi_clk));
+		}
+	}
+
+	/* atomic_enable re-applies it after the DPU reset */
+	if (dpu->ctx.powered)
+		sprd_dpi_init(dpu);
 }
 
 static void sprd_crtc_atomic_enable(struct drm_crtc *crtc,
 				    struct drm_atomic_commit *state)
 {
 	struct sprd_dpu *dpu = to_sprd_crtc(crtc);
+
+	if (sprd_dpu_clk_on(&dpu->ctx)) {
+		drm_err(dpu->drm, "failed to enable dpu clocks\n");
+		return;
+	}
 
 	sprd_dpu_init(dpu);
 
@@ -654,6 +900,7 @@ static void sprd_crtc_atomic_disable(struct drm_crtc *crtc,
 	drm_crtc_vblank_off(&dpu->base);
 
 	sprd_dpu_fini(dpu);
+	sprd_dpu_clk_off(&dpu->ctx);
 
 	spin_lock_irq(&drm->event_lock);
 	if (crtc->state->event) {
@@ -670,7 +917,8 @@ static void sprd_crtc_atomic_flush(struct drm_crtc *crtc,
 	struct sprd_dpu *dpu = to_sprd_crtc(crtc);
 	struct drm_device *drm = dpu->base.dev;
 
-	sprd_dpu_flip(dpu);
+	if (dpu->ctx.powered)
+		sprd_dpu_flip(dpu);
 
 	spin_lock_irq(&drm->event_lock);
 	if (crtc->state->event) {
@@ -684,7 +932,8 @@ static int sprd_crtc_enable_vblank(struct drm_crtc *crtc)
 {
 	struct sprd_dpu *dpu = to_sprd_crtc(crtc);
 
-	dpu_reg_set(&dpu->ctx, REG_DPU_INT_EN, BIT_DPU_INT_VSYNC);
+	if (dpu->ctx.powered)
+		dpu_reg_set(&dpu->ctx, REG_DPU_INT_EN, BIT_DPU_INT_VSYNC);
 
 	return 0;
 }
@@ -693,7 +942,8 @@ static void sprd_crtc_disable_vblank(struct drm_crtc *crtc)
 {
 	struct sprd_dpu *dpu = to_sprd_crtc(crtc);
 
-	dpu_reg_clr(&dpu->ctx, REG_DPU_INT_EN, BIT_DPU_INT_VSYNC);
+	if (dpu->ctx.powered)
+		dpu_reg_clr(&dpu->ctx, REG_DPU_INT_EN, BIT_DPU_INT_VSYNC);
 }
 
 static const struct drm_crtc_helper_funcs sprd_crtc_helper_funcs = {
@@ -704,7 +954,6 @@ static const struct drm_crtc_helper_funcs sprd_crtc_helper_funcs = {
 };
 
 static const struct drm_crtc_funcs sprd_crtc_funcs = {
-	.destroy	= drm_crtc_cleanup,
 	.set_config	= drm_atomic_helper_set_config,
 	.page_flip	= drm_atomic_helper_page_flip,
 	.reset		= drm_atomic_helper_crtc_reset,
@@ -796,6 +1045,148 @@ static int sprd_dpu_context_init(struct sprd_dpu *dpu,
 	if (ctx->irq < 0)
 		return ctx->irq;
 
+	ctx->clk = devm_clk_get_optional(dev, "core");
+	if (IS_ERR(ctx->clk)) {
+		dev_err(dev, "failed to get DPU core clock\n");
+		return PTR_ERR(ctx->clk);
+	}
+
+	/*
+	 * The "core" clock above is actually CLK_DISPC_EB - the APB enable
+	 * gate that lets us touch DPU registers. The DPU pipeline matrix
+	 * clock (CLK_DISPC0, "dispc0-clk" in clk_summary) is a separate
+	 * thing that vendor's BSP calls clk_dpu_core and explicitly
+	 * prepare_enables. Without it the DPU register block is reachable
+	 * but the pipeline itself can't tick - no scanout, no VSYNC, no
+	 * frames. Until 2026-06 mainline relied on clk_ignore_unused
+	 * leaving the bootloader's rate in place; with proper PM that
+	 * stops working.
+	 */
+	ctx->pipe_clk = devm_clk_get_optional(dev, "clk");
+	if (IS_ERR(ctx->pipe_clk)) {
+		dev_err(dev, "failed to get DPU pipeline clock\n");
+		return PTR_ERR(ctx->pipe_clk);
+	}
+	if (ctx->pipe_clk) {
+		int ret = clk_set_rate(ctx->pipe_clk, 384000000);
+
+		if (ret)
+			dev_warn(dev, "failed to set pipe clock rate: %d\n", ret);
+	}
+
+	/*
+	 * The DPU "dpi" clock is the pixel clock that feeds the DPI block.
+	 * Mainline only requested "core" so the framework never had a real
+	 * prepare/enable on the pixel clock: on sharkl5pro it only ran at all
+	 * because clk_ignore_unused left the bootloader's rate alone, but the
+	 * clock framework still saw it as unprepared, so transitions and any
+	 * future PM activity would gate it. Without a properly framework-
+	 * prepared pixel clock the DPI block can't drive valid frames into
+	 * the DSI controller, which then never asserts ready and the
+	 * DPU<->DSI halt handshake stalls forever.
+	 */
+	ctx->dpi_clk = devm_clk_get_optional(dev, "dpi");
+	if (IS_ERR(ctx->dpi_clk)) {
+		dev_err(dev, "failed to get DPU dpi clock\n");
+		return PTR_ERR(ctx->dpi_clk);
+	}
+
+	of_property_read_u32(dev->of_node, "sprd,dpi-clk-div", &ctx->dpi_clk_div);
+	ctx->dpi_clk_fixed = ctx->dpi_clk_div && !dpi_clk_set_rate;
+
+	if (ctx->dpi_clk) {
+		struct clk *dpi_parent;
+
+		dpi_parent = of_clk_get_by_name(dev->of_node, "dpi-parent");
+		if (IS_ERR(dpi_parent)) {
+			struct device_node *parent_np;
+
+			parent_np = of_parse_phandle(dev->of_node, "sprd,dpi-clk-parent", 0);
+			if (parent_np) {
+				struct of_phandle_args clkspec;
+
+				of_node_put(parent_np);
+				if (!of_parse_phandle_with_args(dev->of_node,
+								"sprd,dpi-clk-parent",
+								"#clock-cells", 0, &clkspec)) {
+					dpi_parent = of_clk_get_from_provider(&clkspec);
+					of_node_put(clkspec.np);
+				}
+			}
+		}
+		if (!IS_ERR_OR_NULL(dpi_parent)) {
+			ret = clk_set_parent(ctx->dpi_clk, dpi_parent);
+			if (ret)
+				dev_warn(dev, "failed to reparent dpi clock: %d\n", ret);
+			clk_put(dpi_parent);
+		}
+		dev_info(dev, "dpi clock rate at probe: %lu Hz (div=%u fixed=%d)\n",
+			 clk_get_rate(ctx->dpi_clk), ctx->dpi_clk_div,
+			 ctx->dpi_clk_fixed);
+	}
+
+	{
+		u32 args[3];
+
+		ctx->qos_syscon = syscon_regmap_lookup_by_phandle_args(dev->of_node,
+								       "sprd,qos-syscon",
+								       3, args);
+		if (IS_ERR(ctx->qos_syscon)) {
+			ctx->qos_syscon = NULL;
+		} else {
+			ctx->qos_offset = args[0];
+			ctx->qos_mask = args[1];
+			ctx->qos_val = args[2];
+		}
+	}
+
+	/*
+	 * Optional hardware reset. The bootloader leaves the DPU running and
+	 * (with clk/regulator_ignore_unused) pinned; its shadow registers then
+	 * never latch our config. A soft reset before bring-up clears that.
+	 * reset-syscon = <&ap_ahb_regs offset mask>.
+	 */
+	{
+		u32 args[2];
+
+		ctx->rst_syscon = syscon_regmap_lookup_by_phandle_args(dev->of_node,
+								       "reset-syscon",
+								       2, args);
+		if (IS_ERR(ctx->rst_syscon)) {
+			ctx->rst_syscon = NULL;
+		} else {
+			ctx->rst_offset = args[0];
+			ctx->rst_mask = args[1];
+		}
+	}
+
+	/*
+	 * Optional: the AP DVFS work index for the DPU core clock.
+	 * sprd,dvfs-syscon = <&ap_dvfs offset index>.
+	 */
+	{
+		u32 args[2];
+
+		ctx->dvfs_syscon = syscon_regmap_lookup_by_phandle_args(dev->of_node,
+									"sprd,dvfs-syscon",
+									2, args);
+		if (IS_ERR(ctx->dvfs_syscon)) {
+			ctx->dvfs_syscon = NULL;
+		} else {
+			ctx->dvfs_offset = args[0];
+			ctx->dvfs_index = args[1];
+		}
+	}
+
+	if (ctx->dvfs_syscon)
+		regmap_write(ctx->dvfs_syscon, ctx->dvfs_offset, ctx->dvfs_index);
+
+	/* on from here until the first CRTC disable (bootloader splash) */
+	ret = sprd_dpu_clk_on(ctx);
+	if (ret) {
+		dev_err(dev, "failed to enable DPU clocks\n");
+		return ret;
+	}
 	/* disable and clear interrupts before register dpu IRQ. */
 	writel(0x00, ctx->base + REG_DPU_INT_EN);
 	writel(0xff, ctx->base + REG_DPU_INT_CLR);
@@ -834,11 +1225,30 @@ static int sprd_dpu_bind(struct device *dev, struct device *master, void *data)
 	if (ret)
 		return ret;
 
+	if (device_iommu_mapped(dev)) {
+		ret = sprd_drm_iommu_attach(drm, dev);
+		if (ret) {
+			sprd_dpu_clk_off(&dpu->ctx);
+			return ret;
+		}
+	}
+
 	return 0;
+}
+
+static void sprd_dpu_unbind(struct device *dev,
+			    struct device *master, void *data)
+{
+	struct drm_device *drm = data;
+	struct sprd_dpu *dpu = dev_get_drvdata(dev);
+
+	sprd_drm_iommu_detach(drm, dev);
+	sprd_dpu_clk_off(&dpu->ctx);
 }
 
 static const struct component_ops dpu_component_ops = {
 	.bind = sprd_dpu_bind,
+	.unbind = sprd_dpu_unbind,
 };
 
 static const struct of_device_id dpu_match_table[] = {

@@ -68,6 +68,7 @@
 #define SPRD_DMA_GLB_TRANS_DONE_TRG	BIT(18)
 #define SPRD_DMA_GLB_BLOCK_DONE_TRG	BIT(17)
 #define SPRD_DMA_GLB_FRAG_DONE_TRG	BIT(16)
+#define SPRD_DMA_GLB_TRG_MASK		GENMASK(19, 16)
 #define SPRD_DMA_GLB_TRG_OFFSET		16
 #define SPRD_DMA_GLB_DEST_CHN_MASK	GENMASK(13, 8)
 #define SPRD_DMA_GLB_DEST_CHN_OFFSET	8
@@ -208,7 +209,8 @@ struct sprd_dma_chn {
 struct sprd_dma_dev {
 	struct dma_device	dma_dev;
 	void __iomem		*glb_base;
-	struct clk_bulk_data	clks[2];
+	struct clk		*clk;
+	struct clk		*ashb_clk;
 	int			irq;
 	u32			total_chns;
 	struct sprd_dma_chn	channels[] __counted_by(total_chns);
@@ -259,12 +261,31 @@ static void sprd_dma_chn_update(struct sprd_dma_chn *schan, u32 reg,
 
 static int sprd_dma_enable(struct sprd_dma_dev *sdev)
 {
-	return clk_bulk_prepare_enable(ARRAY_SIZE(sdev->clks), sdev->clks);
+	int ret;
+
+	ret = clk_prepare_enable(sdev->clk);
+	if (ret)
+		return ret;
+
+	/*
+	 * The ashb_clk is optional and only for AGCP DMA controller, so we
+	 * need add one condition to check if the ashb_clk need enable.
+	 */
+	if (!IS_ERR(sdev->ashb_clk))
+		ret = clk_prepare_enable(sdev->ashb_clk);
+
+	return ret;
 }
 
 static void sprd_dma_disable(struct sprd_dma_dev *sdev)
 {
-	clk_bulk_disable_unprepare(ARRAY_SIZE(sdev->clks), sdev->clks);
+	clk_disable_unprepare(sdev->clk);
+
+	/*
+	 * Need to check if we need disable the optional ashb_clk for AGCP DMA.
+	 */
+	if (!IS_ERR(sdev->ashb_clk))
+		clk_disable_unprepare(sdev->ashb_clk);
 }
 
 static void sprd_dma_set_uid(struct sprd_dma_chn *schan)
@@ -424,7 +445,11 @@ static int sprd_dma_set_2stage_config(struct sprd_dma_chn *schan)
 		if (schan->int_type != SPRD_DMA_NO_INT)
 			val |= SPRD_DMA_GLB_SRC_INT;
 
-		sprd_dma_glb_update(sdev, SPRD_DMA_GLB_2STAGE_GRP1, val, val);
+		sprd_dma_glb_update(sdev, SPRD_DMA_GLB_2STAGE_GRP1,
+				    SPRD_DMA_GLB_2STAGE_EN |
+				    SPRD_DMA_GLB_SRC_INT |
+				    SPRD_DMA_GLB_TRG_MASK |
+				    SPRD_DMA_GLB_SRC_CHN_MASK, val);
 		break;
 
 	case SPRD_DMA_SRC_CHN1:
@@ -434,7 +459,11 @@ static int sprd_dma_set_2stage_config(struct sprd_dma_chn *schan)
 		if (schan->int_type != SPRD_DMA_NO_INT)
 			val |= SPRD_DMA_GLB_SRC_INT;
 
-		sprd_dma_glb_update(sdev, SPRD_DMA_GLB_2STAGE_GRP2, val, val);
+		sprd_dma_glb_update(sdev, SPRD_DMA_GLB_2STAGE_GRP2,
+				    SPRD_DMA_GLB_2STAGE_EN |
+				    SPRD_DMA_GLB_SRC_INT |
+				    SPRD_DMA_GLB_TRG_MASK |
+				    SPRD_DMA_GLB_SRC_CHN_MASK, val);
 		break;
 
 	case SPRD_DMA_DST_CHN0:
@@ -444,7 +473,10 @@ static int sprd_dma_set_2stage_config(struct sprd_dma_chn *schan)
 		if (schan->int_type != SPRD_DMA_NO_INT)
 			val |= SPRD_DMA_GLB_DEST_INT;
 
-		sprd_dma_glb_update(sdev, SPRD_DMA_GLB_2STAGE_GRP1, val, val);
+		sprd_dma_glb_update(sdev, SPRD_DMA_GLB_2STAGE_GRP1,
+				    SPRD_DMA_GLB_2STAGE_EN |
+				    SPRD_DMA_GLB_DEST_INT |
+				    SPRD_DMA_GLB_DEST_CHN_MASK, val);
 		break;
 
 	case SPRD_DMA_DST_CHN1:
@@ -454,7 +486,10 @@ static int sprd_dma_set_2stage_config(struct sprd_dma_chn *schan)
 		if (schan->int_type != SPRD_DMA_NO_INT)
 			val |= SPRD_DMA_GLB_DEST_INT;
 
-		sprd_dma_glb_update(sdev, SPRD_DMA_GLB_2STAGE_GRP2, val, val);
+		sprd_dma_glb_update(sdev, SPRD_DMA_GLB_2STAGE_GRP2,
+				    SPRD_DMA_GLB_2STAGE_EN |
+				    SPRD_DMA_GLB_DEST_INT |
+				    SPRD_DMA_GLB_DEST_CHN_MASK, val);
 		break;
 
 	default:
@@ -988,14 +1023,6 @@ sprd_dma_prep_slave_sg(struct dma_chan *chan, struct scatterlist *sgl,
 			start_dst = dst;
 		}
 
-		/*
-		 * The link-list mode needs at least 2 link-list
-		 * configurations. If there is only one sg, it doesn't
-		 * need to fill the link-list configuration.
-		 */
-		if (sglen < 2)
-			break;
-
 		ret = sprd_dma_fill_linklist_desc(chan, sglen, i, src, dst, len,
 						  dir, flags, slave_cfg);
 		if (ret) {
@@ -1120,17 +1147,16 @@ static int sprd_dma_probe(struct platform_device *pdev)
 	if (!sdev)
 		return -ENOMEM;
 
-	/* The ashb_eb clock is optional and only present for AGCP DMA */
-	sdev->clks[0].id = "enable";
-	sdev->clks[1].id = "ashb_eb";
-	ret = devm_clk_bulk_get_optional(&pdev->dev, ARRAY_SIZE(sdev->clks),
-					 sdev->clks);
-	if (ret)
-		return dev_err_probe(&pdev->dev, ret, "get clocks failed\n");
+	sdev->clk = devm_clk_get(&pdev->dev, "enable");
+	if (IS_ERR(sdev->clk)) {
+		dev_err(&pdev->dev, "get enable clock failed\n");
+		return PTR_ERR(sdev->clk);
+	}
 
-	if (!sdev->clks[0].clk)
-		return dev_err_probe(&pdev->dev, -ENOENT,
-				     "get enable clock failed\n");
+	/* ashb clock is optional for AGCP DMA */
+	sdev->ashb_clk = devm_clk_get(&pdev->dev, "ashb_eb");
+	if (IS_ERR(sdev->ashb_clk))
+		dev_warn(&pdev->dev, "no optional ashb eb clock\n");
 
 	/*
 	 * We have three DMA controllers: AP DMA, AON DMA and AGCP DMA. For AGCP
@@ -1193,7 +1219,7 @@ static int sprd_dma_probe(struct platform_device *pdev)
 
 	ret = pm_runtime_get_sync(&pdev->dev);
 	if (ret < 0)
-		goto err_register;
+		goto err_rpm;
 
 	ret = dma_async_device_register(&sdev->dma_dev);
 	if (ret < 0) {
@@ -1215,6 +1241,7 @@ err_of_register:
 err_register:
 	pm_runtime_put_noidle(&pdev->dev);
 	pm_runtime_disable(&pdev->dev);
+err_rpm:
 	sprd_dma_disable(sdev);
 	return ret;
 }
@@ -1270,7 +1297,21 @@ static int __maybe_unused sprd_dma_runtime_resume(struct device *dev)
 	return ret;
 }
 
+/*
+ * The AGCP controller lives in the audcp power domain, which is dropped
+ * over a system suspend, so its clock gates come back cleared. Without
+ * system sleep ops the device stays runtime-active across the suspend, the
+ * clock framework still believes the gates are enabled, and clk_enable() on
+ * the next transfer is a no-op refcount bump that never rewrites the
+ * register - the controller then sits there with no clock, moving no data
+ * and raising no interrupts, for the rest of the boot.
+ *
+ * Forcing a runtime PM cycle around the suspend takes the enable counts
+ * down to zero and back up, so resume really does reprogram the gates.
+ */
 static const struct dev_pm_ops sprd_dma_pm_ops = {
+	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
+				pm_runtime_force_resume)
 	SET_RUNTIME_PM_OPS(sprd_dma_runtime_suspend,
 			   sprd_dma_runtime_resume,
 			   NULL)

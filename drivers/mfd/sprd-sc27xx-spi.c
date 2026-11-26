@@ -15,7 +15,7 @@
 #include <uapi/linux/usb/charger.h>
 
 enum sprd_pmic_type {
-	PMIC_TYPE_SC2730 = 1,
+	PMIC_TYPE_SC2730,
 	PMIC_TYPE_SC2731,
 };
 
@@ -57,13 +57,17 @@ struct sprd_pmic_data {
 
 static const struct mfd_cell sc2730_devices[] = {
 	MFD_CELL_OF("sc2730-adc", NULL, NULL, 0, 0, "sprd,sc2730-adc"),
+	MFD_CELL_OF("sc2730-audio-codec", NULL, NULL, 0, 0, "sprd,sc2730-audio-codec"),
 	MFD_CELL_OF("sc2730-bltc", NULL, NULL, 0, 0, "sprd,sc2730-bltc"),
 	MFD_CELL_OF("sc2730-efuse", NULL, NULL, 0, 0, "sprd,sc2730-efuse"),
 	MFD_CELL_OF("sc2730-eic", NULL, NULL, 0, 0, "sprd,sc2730-eic"),
 	MFD_CELL_OF("sc2730-fgu", NULL, NULL, 0, 0, "sprd,sc2730-fgu"),
+	MFD_CELL_OF("sc2730-pd", NULL, NULL, 0, 0, "sprd,sc2730-pd"),
+	MFD_CELL_NAME("sc2730-poweroff"),
 	MFD_CELL_NAME("sc2730-regulator"),
 	MFD_CELL_OF("sc2730-rtc", NULL, NULL, 0, 0, "sprd,sc2730-rtc"),
 	MFD_CELL_OF("sc2730-vibrator", NULL, NULL, 0, 0, "sprd,sc2730-vibrator"),
+	MFD_CELL_OF("sc2730-wdt", NULL, NULL, 0, 0, "sprd,sc2730-wdt"),
 };
 
 static const struct mfd_cell sc2731_devices[] = {
@@ -186,7 +190,7 @@ static int sprd_pmic_probe(struct spi_device *spi)
 	const struct mfd_cell *cells;
 	int ret, i, num_cells;
 
-	pmic_type = (uintptr_t)of_device_get_match_data(&spi->dev);
+	pmic_type = (enum sprd_pmic_type)of_device_get_match_data(&spi->dev);
 
 	switch (pmic_type) {
 	case PMIC_TYPE_SC2730:
@@ -295,7 +299,7 @@ MODULE_DEVICE_TABLE(of, sprd_pmic_match);
 static const struct spi_device_id sprd_pmic_spi_ids[] = {
 	{ .name = "sc2730", .driver_data = PMIC_TYPE_SC2730 },
 	{ .name = "sc2731", .driver_data = PMIC_TYPE_SC2731 },
-	{ }
+	{},
 };
 MODULE_DEVICE_TABLE(spi, sprd_pmic_spi_ids);
 

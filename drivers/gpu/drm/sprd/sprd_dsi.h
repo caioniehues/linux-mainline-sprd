@@ -6,8 +6,9 @@
 #ifndef __SPRD_DSI_H__
 #define __SPRD_DSI_H__
 
-#include <linux/of.h>
+#include <linux/clk.h>
 #include <linux/device.h>
+#include <linux/of.h>
 #include <linux/regmap.h>
 #include <video/videomode.h>
 
@@ -18,8 +19,8 @@
 #include <drm/drm_print.h>
 #include <drm/drm_panel.h>
 
-#define encoder_to_dsi(encoder) \
-	container_of(encoder, struct sprd_dsi, encoder)
+#define bridge_to_dsi(x)	container_of(x, struct sprd_dsi, bridge)
+#define encoder_to_dsi(x)	container_of(x, struct sprd_dsi, encoder)
 
 enum dsi_work_mode {
 	DSI_MODE_CMD = 0,
@@ -64,6 +65,13 @@ enum pll_timing {
 	TA_WAIT,
 };
 
+struct dphy_pll_platform {
+	u32 band_low;
+	u32 band_mid;
+	u32 band_high;
+	u32 ref_clk; /* dphy reference clock, unit: MHz */
+};
+
 struct dphy_pll {
 	u8 refin; /* Pre-divider control signal */
 	u8 cp_s; /* 00: SDM_EN=1, 10: SDM_EN=0 */
@@ -71,7 +79,6 @@ struct dphy_pll {
 	u8 sdm_en;
 	u8 div;
 	u8 int_n; /* integer N PLL */
-	u32 ref_clk; /* dphy reference clock, unit: MHz */
 	u32 freq; /* panel config, unit: KHz */
 	u32 fvco;
 	u32 potential_fvco;
@@ -81,14 +88,34 @@ struct dphy_pll {
 	u8 out_sel; /* post divider control */
 	u8 vco_band; /* vco range */
 	u8 det_delay;
+	const struct dphy_pll_platform *platform;
 };
 
 struct dsi_context {
 	void __iomem *base;
 	struct regmap *regmap;
+	struct regmap *rst_syscon;
+	u32 rst_offset;
+	u32 rst_mask;
+	/*
+	 * DPHY analog block glue. Vendor BSP global_dphy.c plumbing:
+	 * - phy_en_syscon  : enable bits in AP-AHB syscon (set to enable)
+	 * - phy_pwr_syscon : analog shutdown bit in AP-APB syscon
+	 *                   (clear to power up, set to power down)
+	 * Without these the controller-side PHY interface comes up and
+	 * PHY_STATUS reports digital PLL lock, but the lanes can't
+	 * electrically transmit, the DSI never asserts ready, and the
+	 * DPU<->DSI halt handshake stalls.
+	 */
+	struct regmap *phy_en_syscon;
+	u32 phy_en_offset;
+	u32 phy_en_mask;
+	struct regmap *phy_pwr_syscon;
+	u32 phy_pwr_offset;
+	u32 phy_pwr_mask;
+	struct clk *clk;
 	struct dphy_pll pll;
 	struct videomode vm;
-	bool enabled;
 
 	u8 work_mode;
 	u8 burst_mode;
@@ -109,6 +136,8 @@ struct dsi_context {
 	bool frame_ack_en;
 	/* enable receiving tear effect ack packets - for cmd mode */
 	bool te_ack_en;
+	u32 dpi_clk_div;
+	u8 drive_cap;
 };
 
 struct sprd_dsi {
@@ -116,9 +145,13 @@ struct sprd_dsi {
 	struct mipi_dsi_host host;
 	struct mipi_dsi_device *slave;
 	struct drm_encoder encoder;
+	struct drm_bridge bridge;
 	struct drm_bridge *panel_bridge;
+	struct drm_connector *connector;
 	struct dsi_context ctx;
 };
+
+extern bool dphy_reg02;
 
 int dphy_pll_config(struct dsi_context *ctx);
 void dphy_timing_config(struct dsi_context *ctx);

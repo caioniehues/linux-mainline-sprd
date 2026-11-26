@@ -212,6 +212,51 @@ config ARM_SPEAR_CPUFREQ
 	help
 	  This adds the CPUFreq driver support for SPEAr SOCs.
 
+config ARM_SPRD_CPUFREQ_V2
+	bool "Spreadtrum/Unisoc CPUFreq v2 support"
+	depends on ARCH_SPRD || COMPILE_TEST
+	default y
+	help
+	  This adds the CPUFreq driver support for Spreadtrum/Unisoc SoCs.
+
+config ARM_SPRD_HW_CPUFREQ_NORMAL
+	bool "Sprd apcpu hardware dvfs driver for sharkl5 family SOCs"
+	depends on ARCH_SPRD || COMPILE_TEST
+	select PM_OPP
+	default y if ARCH_SPRD
+	help
+	  This driver enable hardware to adjust the voltage and frequency
+	  automatically for DSU cluster and cores in sharkl5 and the platforms
+	  whose apcpu hardware DVFS IP is similar to sharkl5.
+
+	  If in doubt, say N.
+
+config ARM_SPRD_HW_CPUFREQ_ARCH_UMS512
+	bool "SPRD UMS512 HW DVFS Driver"
+	depends on ARM_SPRD_HW_CPUFREQ_NORMAL
+	default y if ARCH_SPRD
+	help
+	  This includes SPRD UMS512 HW DVFS Architecture-dependent Driver
+
+	  If in doubt, say N.
+
+config ARM_SPRD_CPUFREQ_PUBLIC
+	bool "SPRD CPUfreq Driver Public Data"
+	default y if ARCH_SPRD
+	help
+	  This includes all SPRD cpufreq driver public data, including but
+	  not limted to the EXPORT SYMBOL with the same name.
+
+	  If in doubt, say N.
+
+config ARM_SPRD_TOP_DVFS
+	bool "Spreadtrum/Unisoc TOP DVFS subsystem-DCDC driver"
+	depends on ARCH_SPRD || COMPILE_TEST
+	default y if ARCH_SPRD
+	help
+	  This drives the TOP DVFS controller's subsystem/device DCDC voltage
+	  management (non-CPU rails) on sharkl5pro-family SoCs.
+
 config ARM_STI_CPUFREQ
 	tristate "STi CPUFreq support"
 	depends on CPUFREQ_DT

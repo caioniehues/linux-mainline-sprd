@@ -9,11 +9,14 @@
 #include <linux/clk-provider.h>
 #include <linux/err.h>
 #include <linux/io.h>
+#include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <linux/slab.h>
 
 #include <dt-bindings/clock/sprd,ums512-clk.h>
+#include <dt-bindings/reset/sprd,ums512-reset.h>
 
 #include "common.h"
 #include "composite.h"
@@ -21,6 +24,7 @@
 #include "gate.h"
 #include "mux.h"
 #include "pll.h"
+#include "reset.h"
 
 #define UMS512_MUX_FLAG	\
 	(CLK_GET_RATE_NOCACHE | CLK_SET_RATE_NO_REPARENT)
@@ -104,10 +108,42 @@ static struct clk_hw_onecell_data ums512_pmu_gate_hws = {
 	.num = CLK_PMU_GATE_NUM,
 };
 
+static struct sprd_reset_map ums512_pmu_apb_resets[] = {
+	[RESET_PMU_APB_WTLCP_SOFT_RST]		= { 0x00b0, BIT(0), 0x1000 },
+	[RESET_PMU_APB_PUBCP_SOFT_RST]		= { 0x00b0, BIT(1), 0x1000 },
+	[RESET_PMU_APB_WTLCP_DSP_SOFT_RST]	= { 0x00b0, BIT(2), 0x1000 },
+	[RESET_PMU_APB_MM_SOFT_RST]		= { 0x00b0, BIT(3), 0x1000 },
+	[RESET_PMU_APB_GPU_SOFT_RST]		= { 0x00b0, BIT(4), 0x1000 },
+	[RESET_PMU_APB_AP_SOFT_RST]		= { 0x00b0, BIT(5), 0x1000 },
+	[RESET_PMU_APB_PUB_SOFT_RST]		= { 0x00b0, BIT(6), 0x1000 },
+	[RESET_PMU_APB_APCPU_SOFT_RST]		= { 0x00b0, BIT(7), 0x1000 },
+	[RESET_PMU_APB_SP_SYS_SOFT_RST]		= { 0x00b0, BIT(8), 0x1000 },
+	[RESET_PMU_APB_AUDCP_SYS_SOFT_RST]	= { 0x00b0, BIT(9), 0x1000 },
+	[RESET_PMU_APB_AUDCP_AUDDSP_SOFT_RST]	= { 0x00b0, BIT(10), 0x1000 },
+	[RESET_PMU_APB_CDMA_SOFT_RST]		= { 0x00b0, BIT(11), 0x1000 },
+	[RESET_PMU_APB_WTLCP_AON_SOFT_RST]	= { 0x00b0, BIT(12), 0x1000 },
+	[RESET_PMU_APB_WCDMA_AON_SOFT_RST]	= { 0x00b0, BIT(13), 0x1000 },
+	[RESET_PMU_APB_WTLCP_LDSP_SOFT_RST]	= { 0x00b0, BIT(14), 0x1000 },
+	[RESET_PMU_APB_WTLCP_TGDSP_SOFT_RST]	= { 0x00b0, BIT(15), 0x1000 },
+	[RESET_PMU_APB_AP_VSP_SOFT_RST]		= { 0x00b0, BIT(16), 0x1000 },
+	[RESET_PMU_APB_AP_DVSP_SOFT_RST]	= { 0x00b0, BIT(17), 0x1000 },
+	[RESET_PMU_APB_APCPU_CORE0_MODE_ST_SOFT_RST]	= { 0x00b0, BIT(18), 0x1000 },
+	[RESET_PMU_APB_APCPU_CORE1_MODE_ST_SOFT_RST]	= { 0x00b0, BIT(19), 0x1000 },
+	[RESET_PMU_APB_APCPU_CORE2_MODE_ST_SOFT_RST]	= { 0x00b0, BIT(20), 0x1000 },
+	[RESET_PMU_APB_APCPU_CORE3_MODE_ST_SOFT_RST]	= { 0x00b0, BIT(21), 0x1000 },
+	[RESET_PMU_APB_APCPU_CORE4_MODE_ST_SOFT_RST]	= { 0x00b0, BIT(22), 0x1000 },
+	[RESET_PMU_APB_APCPU_CORE5_MODE_ST_SOFT_RST]	= { 0x00b0, BIT(23), 0x1000 },
+	[RESET_PMU_APB_APCPU_CORE6_MODE_ST_SOFT_RST]	= { 0x00b0, BIT(24), 0x1000 },
+	[RESET_PMU_APB_APCPU_CORE7_MODE_ST_SOFT_RST]	= { 0x00b0, BIT(25), 0x1000 },
+	[RESET_PMU_APB_APCPU_CLUSTER_MODE_ST_SOFT_RST] = { 0x00b0, BIT(26), 0x1000 },
+};
+
 static struct sprd_clk_desc ums512_pmu_gate_desc = {
 	.clk_clks	= ums512_pmu_gate_clks,
 	.num_clk_clks	= ARRAY_SIZE(ums512_pmu_gate_clks),
-	.hw_clks        = &ums512_pmu_gate_hws,
+	.hw_clks	= &ums512_pmu_gate_hws,
+	.resets		= ums512_pmu_apb_resets,
+	.num_resets	= ARRAY_SIZE(ums512_pmu_apb_resets),
 };
 
 /* pll clock at g0 */
@@ -1714,13 +1750,14 @@ static const struct clk_parent_data gpu_parents[] = {
 	{ .hw = &gpll.common.hw  },
 };
 
-static SPRD_COMP_CLK_DATA(gpu_core_clk, "gpu-core-clk", gpu_parents,
+/* Reparent-capable: GPU DVFS OPPs live on different parent PLLs. */
+static SPRD_COMP_CLK_DATA_REPARENT(gpu_core_clk, "gpu-core-clk", gpu_parents,
 			  0x4, 4, 3, 8, 3, 0);
 
 static SPRD_GATE_CLK_HW(gpu_mem_gate, "gpu-mem-gate", &gpu_eb.common.hw,
 			0x8, BIT(0), 0, 0);
 
-static SPRD_COMP_CLK_DATA(gpu_mem_clk, "gpu-mem-clk", gpu_parents,
+static SPRD_COMP_CLK_DATA_REPARENT(gpu_mem_clk, "gpu-mem-clk", gpu_parents,
 			  0x8, 4, 3, 8, 3, 0);
 
 static SPRD_GATE_CLK_HW(gpu_sys_gate, "gpu-sys-gate", &gpu_eb.common.hw,
@@ -1751,10 +1788,17 @@ static struct clk_hw_onecell_data ums512_gpu_clk_hws = {
 	.num	= CLK_GPU_CLK_NUM,
 };
 
+static struct sprd_reset_map ums512_gpu_apb_resets[] = {
+	[RESET_GPU_APB_GPU_CORE_SOFT_RST]	= { 0x0000, BIT(0), 0x1000 },
+	[RESET_GPU_APB_SYS_SOFT_RST_REQ_CORE]	= { 0x0000, BIT(1), 0x1000 },
+};
+
 static struct sprd_clk_desc ums512_gpu_clk_desc = {
 	.clk_clks	= ums512_gpu_clk,
 	.num_clk_clks	= ARRAY_SIZE(ums512_gpu_clk),
 	.hw_clks	= &ums512_gpu_clk_hws,
+	.resets		= ums512_gpu_apb_resets,
+	.num_resets	= ARRAY_SIZE(ums512_gpu_apb_resets),
 };
 
 /* mm clocks */
@@ -2175,6 +2219,7 @@ MODULE_DEVICE_TABLE(of, sprd_ums512_clk_ids);
 static int ums512_clk_probe(struct platform_device *pdev)
 {
 	const struct sprd_clk_desc *desc;
+	struct sprd_reset *reset;
 	int ret;
 
 	desc = device_get_match_data(&pdev->dev);
@@ -2185,6 +2230,37 @@ static int ums512_clk_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	/*
+	 * Controllers inside switchable power domains (gpu_clk, mm_gate,
+	 * mm_clk take power-domains in DT) must not have their registers
+	 * touched while the domain is off: the clk core skips .is_enabled
+	 * and resumes the provider around prepare only when the provider
+	 * device has runtime PM enabled (mirrors ums9230_clk_probe).
+	 */
+	pm_runtime_set_active(&pdev->dev);
+	ret = devm_pm_runtime_enable(&pdev->dev);
+	if (ret)
+		return ret;
+
+	if (desc->num_resets > 0) {
+		struct sprd_clk_drvdata *data = platform_get_drvdata(pdev);
+
+		reset = devm_kzalloc(&pdev->dev, sizeof(*reset), GFP_KERNEL);
+		if (!reset)
+			return -ENOMEM;
+
+		spin_lock_init(&reset->lock);
+		reset->rcdev.of_node = pdev->dev.of_node;
+		reset->rcdev.ops = &sprd_sc_reset_ops;
+		reset->rcdev.nr_resets = desc->num_resets;
+		reset->reset_map = desc->resets;
+		reset->regmap = data->regmap;
+
+		ret = devm_reset_controller_register(&pdev->dev, &reset->rcdev);
+		if (ret)
+			dev_warn(&pdev->dev, "Failed to register reset controller\n");
+	}
+
 	return sprd_clk_probe(&pdev->dev, desc->hw_clks);
 }
 
@@ -2193,6 +2269,7 @@ static struct platform_driver ums512_clk_driver = {
 	.driver	= {
 		.name	= "ums512-clk",
 		.of_match_table	= sprd_ums512_clk_ids,
+		.pm	= pm_ptr(&sprd_clk_pm_ops),
 	},
 };
 module_platform_driver(ums512_clk_driver);

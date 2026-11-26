@@ -51,10 +51,10 @@
 #define SPRD_EIC_SYNC_DATA		0x1c
 
 /*
- * The digital-chip EIC controller can support maximum 3 banks, and each bank
+ * The digital-chip EIC controller can support maximum 8 banks, and each bank
  * contains 8 EICs.
  */
-#define SPRD_EIC_MAX_BANK		3
+#define SPRD_EIC_MAX_BANK		8
 #define SPRD_EIC_PER_BANK_NR		8
 #define SPRD_EIC_DATA_MASK		GENMASK(7, 0)
 #define SPRD_EIC_BIT(x)			((x) & (SPRD_EIC_PER_BANK_NR - 1))
@@ -95,7 +95,7 @@ struct sprd_eic {
 	struct notifier_block irq_nb;
 	void __iomem *base[SPRD_EIC_MAX_BANK];
 	enum sprd_eic_type type;
-	raw_spinlock_t lock;
+	spinlock_t lock;
 	int irq;
 };
 
@@ -149,7 +149,7 @@ static void sprd_eic_update(struct gpio_chip *chip, unsigned int offset,
 	unsigned long flags;
 	u32 tmp;
 
-	raw_spin_lock_irqsave(&sprd_eic->lock, flags);
+	spin_lock_irqsave(&sprd_eic->lock, flags);
 	tmp = readl_relaxed(base + reg);
 
 	if (val)
@@ -158,7 +158,7 @@ static void sprd_eic_update(struct gpio_chip *chip, unsigned int offset,
 		tmp &= ~BIT(SPRD_EIC_BIT(offset));
 
 	writel_relaxed(tmp, base + reg);
-	raw_spin_unlock_irqrestore(&sprd_eic->lock, flags);
+	spin_unlock_irqrestore(&sprd_eic->lock, flags);
 }
 
 static int sprd_eic_read(struct gpio_chip *chip, unsigned int offset, u16 reg)
@@ -628,7 +628,7 @@ static int sprd_eic_probe(struct platform_device *pdev)
 	if (!sprd_eic)
 		return -ENOMEM;
 
-	raw_spin_lock_init(&sprd_eic->lock);
+	spin_lock_init(&sprd_eic->lock);
 	sprd_eic->type = pdata->type;
 
 	sprd_eic->irq = platform_get_irq(pdev, 0);
@@ -637,7 +637,7 @@ static int sprd_eic_probe(struct platform_device *pdev)
 
 	for (i = 0; i < SPRD_EIC_MAX_BANK; i++) {
 		/*
-		 * We can have maximum 3 banks EICs, and each EIC has
+		 * We can have maximum 8 banks EICs, and each EIC has
 		 * its own base address. But some platform maybe only
 		 * have one bank EIC, thus base[1] and base[2] can be
 		 * optional.

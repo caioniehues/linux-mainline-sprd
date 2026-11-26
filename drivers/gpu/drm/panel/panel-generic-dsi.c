@@ -1,0 +1,897 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Generic MIPI-DSI panel driver
+ * Copyright (C) 2024 ROCKNIX
+ *
+ * based on
+ *
+ * Rockteck jh057n00900 5.5" MIPI-DSI panel driver
+ * Copyright (C) Purism SPC 2019
+ */
+
+#include <linux/backlight.h>
+#include <linux/delay.h>
+#include <linux/gpio/consumer.h>
+#include <linux/hex.h>
+#include <linux/media-bus-format.h>
+#include <linux/module.h>
+#include <linux/firmware.h>
+#include <linux/of.h>
+#include <linux/panel_generic_dsi.h>
+#include <linux/regulator/consumer.h>
+
+#include <video/display_timing.h>
+#include <video/mipi_display.h>
+
+#include <drm/drm_mipi_dsi.h>
+#include <drm/drm_modes.h>
+#include <drm/drm_of.h>
+#include <drm/drm_panel.h>
+
+#define DRIVER_NAME "panel-generic-dsi"
+
+static BLOCKING_NOTIFIER_HEAD(generic_panel_notifier_list);
+
+int generic_panel_register_notifier(struct notifier_block *nb)
+{
+    return blocking_notifier_chain_register(&generic_panel_notifier_list, nb);
+}
+EXPORT_SYMBOL_GPL(generic_panel_register_notifier);
+
+int generic_panel_unregister_notifier(struct notifier_block *nb)
+{
+    return blocking_notifier_chain_unregister(&generic_panel_notifier_list, nb);
+}
+EXPORT_SYMBOL_GPL(generic_panel_unregister_notifier);
+
+static char *descfile = "";
+module_param(descfile,charp,0660);
+MODULE_PARM_DESC(descfile, "Panel description filename in firmware dir");
+
+static bool dcs_backlight = true;
+module_param(dcs_backlight, bool, 0644);
+MODULE_PARM_DESC(dcs_backlight, "Register a DCS 0x51 12-bit backlight device");
+
+static unsigned int init_brightness = 0x222;
+module_param(init_brightness, uint, 0644);
+MODULE_PARM_DESC(init_brightness, "Initial 12-bit DCS brightness sent during prepare (0 = skip)");
+
+static bool skip_init;
+module_param(skip_init, bool, 0644);
+MODULE_PARM_DESC(skip_init, "Skip panel prepare/unprepare hardware init (bootloader handoff)");
+
+static unsigned int init_delay_us;
+module_param(init_delay_us, uint, 0644);
+MODULE_PARM_DESC(init_delay_us, "Optional udelay after each init sequence command");
+
+static unsigned int mode_clock_khz;
+module_param(mode_clock_khz, uint, 0644);
+MODULE_PARM_DESC(mode_clock_khz, "Override panel mode pixel clock in kHz (0 = description default)");
+
+struct generic_panel_delays {
+    int prepare;
+    int reset;
+    int init;
+    int enable;
+    int ready;
+};
+
+struct generic_panel_size {
+    int width;
+    int height;
+};
+
+struct generic_panel_mode {
+    int clock;
+    int horizontal[5];
+    int vertical[5];
+    int is_default;
+    struct generic_panel_mode *prev;
+};
+
+#define DCS_PSEUDO_CMD_SEQ 0x10000
+struct generic_panel_init_seq {
+    int dcs;
+    int len;
+    int read;
+    int wait;
+    u8 *data;
+    struct generic_panel_init_seq *link;
+};
+
+struct generic_panel {
+    struct device *dev;
+    struct drm_panel panel;
+    struct gpio_desc *enable_gpio;
+    struct gpio_desc *reset_gpio;
+    struct regulator *vdd;
+    struct regulator *iovcc;
+    struct backlight_device *bl;
+
+    struct generic_panel_delays delays;
+    struct generic_panel_size size;
+    struct generic_panel_mode *modes;
+    struct generic_panel_init_seq *iseq;
+
+    enum drm_panel_orientation orientation;
+    bool prepared;
+    bool display_on_sent;
+};
+
+
+int load_panel_description(struct mipi_dsi_device *dsi, struct generic_panel *ctx);
+int load_panel_description_line(char *data, struct mipi_dsi_device *dsi, struct generic_panel *ctx);
+int load_globals(char *data, struct mipi_dsi_device *dsi, struct generic_panel *ctx);
+int load_mode(char *data, struct mipi_dsi_device *dsi, struct generic_panel *ctx);
+int load_init_seq(char *data, struct mipi_dsi_device *dsi, struct generic_panel *ctx);
+
+
+
+int load_globals(char *data, struct mipi_dsi_device *dsi, struct generic_panel *ctx) {
+    struct device *dev = &dsi->dev;
+    char *param, *val;
+    while (*data) {
+        data = next_arg(data, &param, &val);
+        if (!val) continue;
+        if (strcmp(param, "delays") == 0) {
+            int delays[] = {0, 5, 1, 25, 120, 50};
+            get_options(val, 6, delays);
+            ctx->delays.prepare     = delays[1];
+            ctx->delays.reset       = delays[2];
+            ctx->delays.init        = delays[3];
+            ctx->delays.enable      = delays[4];
+            ctx->delays.ready       = delays[5];
+        } else if (strcmp(param, "size") == 0) {
+            int size[] = {0, -1, -1};
+            get_options(val, 3, size);
+            ctx->size.width         = size[1];
+            ctx->size.height        = size[2];
+        } else if (strcmp(param, "format") == 0) {
+            if (strcmp(val, "rgb888") == 0) {
+                dsi->format = MIPI_DSI_FMT_RGB888;
+            } else if (strcmp(val, "rgb666") == 0) {
+                dsi->format = MIPI_DSI_FMT_RGB666;
+            } else if (strcmp(val, "rgb666_packed") == 0) {
+                dsi->format = MIPI_DSI_FMT_RGB666_PACKED;
+            } else if (strcmp(val, "rgb565") == 0) {
+                dsi->format = MIPI_DSI_FMT_RGB565;
+            } else {
+                dev_info(dev, "bad format %s\n", val);
+            }
+        } else if (strcmp(param, "lanes") == 0) {
+            if (get_option(&val, &dsi->lanes) == 0) {
+                dev_info(dev, "bad lanes %s\n", val);
+            }
+        } else if (strcmp(param, "flags") == 0) {
+            int flags;
+            if (get_option(&val, &flags) == 0) {
+                dev_info(dev, "bad flags %s\n", val);
+            } else {
+                dsi->mode_flags = flags;
+            }
+        } else if (strcmp(param, "hs_rate") == 0) {
+            int hs_rate;
+            if (get_option(&val, &hs_rate) == 0) {
+                dev_info(dev, "bad hs_rate %s\n", val);
+            } else {
+                dsi->hs_rate = hs_rate;
+            }
+        } else if (strcmp(param, "lp_rate") == 0) {
+            int lp_rate;
+            if (get_option(&val, &lp_rate) == 0) {
+                dev_info(dev, "bad lp_rate %s\n", val);
+            } else {
+                dsi->lp_rate = lp_rate;
+            }
+        } else {
+            dev_info(dev, "unknown param %s\n", param);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+
+int load_mode(char *data, struct mipi_dsi_device *dsi, struct generic_panel *ctx) {
+    struct device *dev = &dsi->dev;
+    struct generic_panel_mode *mode;
+    char *param, *val;
+
+    mode = devm_kzalloc(dev, sizeof(*mode), GFP_KERNEL);
+
+    while (*data) {
+        data = next_arg(data, &param, &val);
+        if (!val) continue;
+        if (strcmp(param, "clock") == 0) {
+            if (get_option(&val, &mode->clock) == 0) {
+                dev_info(dev, "bad clock %s\n", val);
+            }
+        } else if (strcmp(param, "horizontal") == 0) {
+            get_options(val, 5, &mode->horizontal[0]);
+        } else if (strcmp(param, "vertical") == 0) {
+            get_options(val, 5, &mode->vertical[0]);
+        } else if (strcmp(param, "default") == 0) {
+            get_option(&val, &mode->is_default);
+        } else {
+            dev_info(dev, "Mode unhandled %s = %s\n", param, val);
+        }
+    }
+
+    if ((mode->clock > 5000) && (mode->vertical[1] > 0) && (mode->horizontal[1] > 0)) {
+        mode->prev = ctx->modes;
+        ctx->modes = mode;
+        dev_dbg(dev, "Mode %d %d %d  %p -> %p\n", mode->clock, mode->vertical[1], mode->horizontal[1], mode, mode->prev);
+        return 0;
+    }
+    return -1;
+}
+
+int load_init_seq(char *data, struct mipi_dsi_device *dsi, struct generic_panel *ctx) {
+    struct device *dev = &dsi->dev;
+    struct generic_panel_init_seq *item;
+    char *param, *val;
+
+    item = devm_kzalloc(dev, sizeof(*item), GFP_KERNEL);
+    item->dcs = -1;
+    item->len = -1;
+    item->read = 0;
+    item->wait = 0;
+
+    while (*data) {
+        data = next_arg(data, &param, &val);
+        if (!val) continue;
+        if (strcmp(param, "dcs") == 0) {
+            item->dcs = simple_strtoul(val, NULL, 16) & 0xFF;
+            //dev_info(dev, "Init dcs %02x\n", item->dcs);
+        } else if (strcmp(param, "data") == 0) {
+            item->len = (strlen(val)) >> 1;
+            item->data = devm_kzalloc(dev, item->len, GFP_KERNEL);
+            if (hex2bin(item->data, val, item->len) != 0) {
+                dev_info(dev, "bad data %s\n", val);
+                return -1;
+            }
+            //for (int i=0; i < (item->len); i++) { dev_info(dev, " %02x", item->data[i]);};
+            //dev_info(dev, "\n");
+        } else if (strcmp(param, "seq") == 0) {
+            item->dcs = DCS_PSEUDO_CMD_SEQ;
+            item->len = (strlen(val)) >> 1;
+            item->data = devm_kzalloc(dev, item->len, GFP_KERNEL);
+            if (hex2bin(item->data, val, item->len) != 0) {
+                dev_info(dev, "bad seq %s\n", val);
+                return -1;
+            }
+            dev_dbg(dev, "loaded seq len=%d %s\n", item->len, val);
+        } else if (strcmp(param, "read") == 0) {
+            item->read = simple_strtoul(val, NULL, 16);
+        } else if (strcmp(param, "wait") == 0) {
+            item->wait = simple_strtoul(val, NULL, 16);
+        } else {
+            dev_info(dev, "Init unhandled %s = %s\n", param, val);
+        }
+    }
+
+    if (item->dcs >= 0) {
+        item->link = ctx->iseq;
+        ctx->iseq = item;
+        return 0;
+    }
+
+    return -1;
+}
+
+/*
+ * data   is a null-terminated string of panel description
+ */
+int load_panel_description_line(char *data, struct mipi_dsi_device *dsi, struct generic_panel *ctx) {
+    size_t pos;
+    for (pos = 0; data[pos] != 0; pos ++) {
+        if ((data[pos] == '#') || data[pos] == '\n') {
+            data[pos] = 0;
+            break;
+        }
+    }
+    if (pos < 2) return 0;
+
+    switch (data[0]) {
+        case 'G':
+            load_globals(data+1, dsi, ctx);
+            break;
+        case 'M':
+            load_mode(data+1, dsi, ctx);
+            break;
+        case 'I':
+            load_init_seq(data+1, dsi, ctx);
+            break;
+        default:
+            dev_info(NULL, "Unhandled %s\n", data);
+    }
+
+    return 0;
+}
+
+int panel_description_foreach(struct mipi_dsi_device *dsi, struct generic_panel *ctx,
+        int (*handle_line)(char*, struct mipi_dsi_device*, struct generic_panel*));
+
+int panel_description_foreach(struct mipi_dsi_device *dsi, struct generic_panel *ctx,
+        int (*handle_line)(char*, struct mipi_dsi_device*, struct generic_panel*))
+{
+    struct device *dev = &dsi->dev;
+    const struct firmware *fw;
+    int ret;
+
+    if (strlen(descfile) > 0) {
+        ret = request_firmware(&fw, descfile, dev);
+        if (ret) {
+            dev_err(dev, "No config file found (error=%d)\n", ret);
+            return -1;
+        }
+
+        size_t pos = 0, size = fw->size;
+        char *data = (char *)fw->data;
+
+        while (pos < size) {
+            while ((pos < size) && (data[pos] != '\n')) pos++;
+
+            if (pos < size) pos++;
+            data[pos - 1] = 0;
+
+            handle_line(data, dsi, ctx);
+
+            data = &data[pos];
+            size = size - pos;
+            pos = 0;
+        }
+
+        release_firmware(fw);
+    } else {
+        //ret = drm_of_get_panel_orientation(dev->of_node, &ctx->orientation);
+        const char *line;
+        char * buf;
+        size_t linescnt, i;
+
+        linescnt = of_property_count_strings(dev->of_node, "panel_description");
+        if (linescnt < 1) {
+            dev_err(dev, "failed to read panel_description from device tree %ld\n", linescnt);
+            return -1;
+        }
+
+        for (i = 0; i < linescnt; i++) {
+            ret = of_property_read_string_index(dev->of_node, "panel_description", i, &line);
+            if (ret < 0) {
+                dev_err(dev, "failed to read panel_description[%ld] from device tree %d\n", i, ret);
+                return -1;
+            }
+            buf = kstrdup(line, GFP_KERNEL);
+            if (!buf) {
+                dev_err(dev, "kstrdup(of desc line) failed\n");
+                return -1;
+            }
+
+            dev_dbg(dev, "desc[%ld]: %s", i, line);
+            handle_line(buf, dsi, ctx);
+            kfree(buf);
+        }
+    }
+    return 0;
+}
+
+int load_panel_description(struct mipi_dsi_device *dsi, struct generic_panel *ctx) {
+    int ret;
+
+    ret = panel_description_foreach(dsi, ctx, &load_panel_description_line);
+    if (ret < 0) { return ret; }
+
+    // Reverse iseq
+    struct generic_panel_init_seq *rev = ctx->iseq, *fwd = NULL, *tmp = NULL;
+    while (rev) {
+        tmp = rev;
+        rev = tmp->link;
+        tmp->link = fwd;
+        fwd = tmp;
+    }
+    ctx->iseq = fwd;
+
+
+    return 0;
+}
+
+
+static inline struct generic_panel *panel_to_generic_panel(struct drm_panel *panel)
+{
+    return container_of(panel, struct generic_panel, panel);
+}
+
+static int generic_panel_init_sequence(struct generic_panel *ctx)
+{
+    struct mipi_dsi_device *dsi = to_mipi_dsi_device(ctx->dev);
+    struct device *dev = ctx->dev;
+    int ret;
+
+    struct generic_panel_init_seq *iseq = ctx->iseq;
+    while (iseq) {
+        if (iseq->read > 0) {
+            u8 readbuf[8];
+            if (iseq->read > 8) { iseq->read = 8; }
+            ret = mipi_dsi_generic_read(dsi, iseq->data, iseq->len, &readbuf[0], iseq->read);
+            if (ret < 0) {
+                dev_err(ctx->dev, "failed to read: %d\n", ret);
+            } else {
+                for (int i = 0; i < ret; i++) {
+                    dev_info(ctx->dev, "read[%d]: %02x\n", i, readbuf[i]);
+                }
+            }
+        } else if (iseq->dcs == DCS_PSEUDO_CMD_SEQ) {
+            ret = mipi_dsi_dcs_write_buffer(dsi, iseq->data, iseq->len);
+            dev_dbg(dev, "iseq 0x%px len=%d -> %d\n", (void*)iseq, iseq->len, ret);
+        } else {
+            ret = mipi_dsi_dcs_write(dsi, iseq->dcs, iseq->data, iseq->len);
+            dev_dbg(dev, "iseq %02x len=%d -> %d\n", iseq->dcs, iseq->len, ret);
+        }
+        if (ret < 0) {
+            dev_err(dev, "panel init command 0x%x failed: %d\n",
+                    iseq->dcs, ret);
+            return ret;
+        }
+        if (iseq->wait) {
+            msleep(iseq->wait);
+        }
+        if (init_delay_us) {
+            udelay(init_delay_us);
+        }
+        iseq = iseq->link;
+    }
+
+    dev_dbg(dev, "Panel init sequence done\n");
+
+    return 0;
+}
+
+static int generic_panel_bl_update_status(struct backlight_device *bl)
+{
+    struct generic_panel *ctx = bl_get_data(bl);
+    struct mipi_dsi_device *dsi = to_mipi_dsi_device(ctx->dev);
+    u16 b = ((bl->props.brightness * 0xfff + 0x7f) / 0xff) & 0xfff;
+    int ret;
+
+    if (!ctx->prepared)
+        return 0;
+
+    ret = mipi_dsi_dcs_set_display_brightness_large(dsi, b);
+    if (ret < 0) {
+        dev_err(ctx->dev, "failed to set brightness 0x%03x: %d\n", b, ret);
+        return ret;
+    }
+
+    return 0;
+}
+
+static const struct backlight_ops generic_panel_bl_ops = {
+    .update_status = generic_panel_bl_update_status,
+};
+
+/*
+ * Assume u-boot left the panel fully initialized and skip the kernel's first
+ * prepare/unprepare cycle. The kernel's panel-side teardown was destroying
+ * u-boot's state; skipping it is REQUIRED for the panel to light (build #76:
+ * fbcon visible + boot to Debian login). sprd_dpu/sprd_dsi still reset
+ * themselves -- this only isolates the panel-side contribution.
+ *
+ * DO NOT set this to false except as a deliberate last-resort diagnostic, or
+ * once we are extremely confident the kernel can cold-init the panel without
+ * u-boot's state. Flipping it to false is exactly what regressed the display
+ * from the working #67 prehandoff image to a black kernel-native path.
+ * See DISPLAY-KNOWN-GOOD-DSI-STATE.md / WHAT-HAS-BEEN-TRIED.md.
+ *
+ * CURRENTLY false ON PURPOSE for the prepare_prev_first cold-init experiment
+ * (paired with ctx->panel.prepare_prev_first = true in probe). This is the
+ * deliberate cold-init diagnostic the warning above refers to. Recovery if the
+ * panel stays black is a reboot to the on-disk image. Set back to true to
+ * restore the known-good U-Boot-handoff display.
+ */
+static int generic_panel_unprepare(struct drm_panel *panel)
+{
+    struct generic_panel *ctx = panel_to_generic_panel(panel);
+    struct mipi_dsi_device *dsi = to_mipi_dsi_device(ctx->dev);
+    int ret;
+
+    if (!ctx->prepared)
+        return 0;
+
+    if (skip_init) {
+        ctx->prepared = false;
+        dev_info(ctx->dev, "handoff: skipping unprepare\n");
+        return 0;
+    }
+
+    ret = mipi_dsi_dcs_set_display_off(dsi);
+    if (ret < 0)
+        dev_err(ctx->dev, "failed to set display off: %d\n", ret);
+
+    ret = mipi_dsi_dcs_enter_sleep_mode(dsi);
+    if (ret < 0) {
+        dev_err(ctx->dev, "failed to enter sleep mode: %d\n", ret);
+        return ret;
+    }
+
+    if (ctx->enable_gpio) { gpiod_set_value_cansleep(ctx->enable_gpio, 0); }
+    gpiod_set_value_cansleep(ctx->reset_gpio, 1);
+
+    regulator_disable(ctx->iovcc);
+    regulator_disable(ctx->vdd);
+
+    gpiod_set_value_cansleep(ctx->reset_gpio, 1);
+
+    ctx->prepared = false;
+    ctx->display_on_sent = false;
+    blocking_notifier_call_chain(&generic_panel_notifier_list,
+                                 GENERIC_PANEL_EVENT_UNPREPARED, NULL);
+
+    return 0;
+}
+
+static int generic_panel_prepare(struct drm_panel *panel)
+{
+    struct generic_panel *ctx = panel_to_generic_panel(panel);
+    struct mipi_dsi_device *dsi = to_mipi_dsi_device(ctx->dev);
+    static const u8 sleep_out[] = { MIPI_DCS_EXIT_SLEEP_MODE };
+    static const u8 display_on[] = { MIPI_DCS_SET_DISPLAY_ON };
+    int dispon_ret;
+    int ret;
+
+    if (ctx->prepared) {
+        return 0;
+    }
+
+    if (skip_init) {
+        dev_info(ctx->dev, "handoff: keeping bootloader panel\n");
+        ctx->prepared = true;
+        return 0;
+    }
+
+    ret = regulator_enable(ctx->vdd);
+    if (ret < 0) {
+        dev_err(ctx->dev, "Failed to enable vdd supply: %d\n", ret);
+        return ret;
+    }
+    msleep(5);
+
+    ret = regulator_enable(ctx->iovcc);
+    if (ret < 0) {
+        dev_err(ctx->dev, "Failed to enable iovcc supply: %d\n", ret);
+        goto disable_vdd;
+    }
+    msleep(5);
+
+    if (ctx->enable_gpio) { gpiod_set_value_cansleep(ctx->enable_gpio, 1); }
+    msleep(ctx->delays.prepare);
+
+    /* Active-high DTS reset-gpios: pulse 1 -> 0 -> 1 to release reset high. */
+    gpiod_set_value_cansleep(ctx->reset_gpio, 1);
+    msleep(ctx->delays.prepare);
+    gpiod_set_value_cansleep(ctx->reset_gpio, 0);
+    msleep(ctx->delays.reset);
+    gpiod_set_value_cansleep(ctx->reset_gpio, 1);
+    msleep(ctx->delays.init);
+
+    ret = generic_panel_init_sequence(ctx);
+    if (ret < 0) {
+        dev_err(ctx->dev, "Panel init sequence failed: %d\n", ret);
+        goto disable_iovcc;
+    }
+
+    if (init_brightness) {
+        ret = mipi_dsi_dcs_set_display_brightness_large(dsi, init_brightness & 0xfff);
+        dev_info(ctx->dev, "init brightness 0x%03x ret=%d\n",
+                 init_brightness & 0xfff, ret);
+        if (ret < 0)
+            dev_warn(ctx->dev, "failed to set init brightness: %d\n", ret);
+    }
+
+    ret = mipi_dsi_dcs_write_buffer(dsi, sleep_out, sizeof(sleep_out));
+    if (ret < 0) {
+        dev_err(ctx->dev, "Failed to exit sleep mode: %d\n", ret);
+        goto disable_iovcc;
+    }
+
+    msleep(200);
+
+    dispon_ret = mipi_dsi_dcs_write_buffer(dsi, display_on, sizeof(display_on));
+    dev_info(ctx->dev, "display_on (cmd mode) ret=%d\n", dispon_ret);
+    ctx->display_on_sent = (dispon_ret >= 0);
+    msleep(20);
+
+    ctx->prepared = true;
+
+    if (ctx->bl)
+        generic_panel_bl_update_status(ctx->bl);
+
+    blocking_notifier_call_chain(&generic_panel_notifier_list,
+                                 GENERIC_PANEL_EVENT_PREPARED, NULL);
+
+    return 0;
+
+disable_iovcc:
+    regulator_disable(ctx->iovcc);
+disable_vdd:
+    regulator_disable(ctx->vdd);
+    return ret;
+}
+
+/* drm_display_mode template without clock as it is variable */
+static const struct drm_display_mode mode_template = { };
+
+
+static int generic_panel_get_modes(struct drm_panel *panel,
+                struct drm_connector *connector)
+{
+    struct generic_panel *ctx = panel_to_generic_panel(panel);
+    struct drm_display_mode mode_tmp;
+    struct drm_display_mode *mode;
+    struct generic_panel_mode *genmode = ctx->modes;
+
+    while (genmode) {
+        dev_dbg(ctx->dev, "gen mode %d %dx%d\n", genmode->clock, genmode->horizontal[1], genmode->vertical[1]);
+
+        mode_tmp = mode_template;
+
+        mode_tmp.clock          = mode_clock_khz ? mode_clock_khz : genmode->clock;
+
+        mode_tmp.hdisplay       = genmode->horizontal[1];
+        mode_tmp.hsync_start    = mode_tmp.hdisplay + genmode->horizontal[2];
+        mode_tmp.hsync_end      = mode_tmp.hsync_start + genmode->horizontal[3];
+        mode_tmp.htotal         = mode_tmp.hsync_end + genmode->horizontal[4];
+
+        mode_tmp.vdisplay       = genmode->vertical[1];
+        mode_tmp.vsync_start    = mode_tmp.vdisplay + genmode->vertical[2];
+        mode_tmp.vsync_end      = mode_tmp.vsync_start + genmode->vertical[3];
+        mode_tmp.vtotal         = mode_tmp.vsync_end + genmode->vertical[4];
+
+        mode_tmp.width_mm       = ctx->size.width;
+        mode_tmp.height_mm      = ctx->size.height;
+
+        /*
+         * Stock Spreadtrum DT omits hsync-active/vsync-active so DRM
+         * defaults to active-high; the sprd DSI controller also leaves
+         * DPI input polarity at its active-high reset default. Driving
+         * NHSYNC/NVSYNC here would make the DPU emit active-low syncs,
+         * the DSI then never recognises a valid frame, and the panel
+         * stays black even though DPU and DPHY are running.
+         */
+        mode_tmp.flags          = DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC;
+
+        mode = drm_mode_duplicate(connector->dev, &mode_tmp);
+        if (!mode) {
+            dev_err(ctx->dev, "Failed to add mode %u\n",
+                drm_mode_vrefresh(mode));
+            return -ENOMEM;
+        }
+        drm_mode_set_name(mode);
+
+        mode->type = DRM_MODE_TYPE_DRIVER;
+        if (genmode->is_default) { mode->type |= DRM_MODE_TYPE_PREFERRED; };
+
+        drm_mode_probed_add(connector, mode);
+
+        genmode = genmode->prev;
+    }
+
+    connector->display_info.width_mm = ctx->size.width;
+    connector->display_info.height_mm = ctx->size.height;
+
+
+    /*
+     * TODO: Remove once all drm drivers call
+     * drm_connector_set_orientation_from_panel()
+     */
+    drm_connector_set_panel_orientation(connector, ctx->orientation);
+
+    return 1;
+}
+
+static enum drm_panel_orientation generic_panel_get_orientation(struct drm_panel *panel)
+{
+    struct generic_panel *ctx = panel_to_generic_panel(panel);
+
+    return ctx->orientation;
+}
+
+static int generic_panel_enable(struct drm_panel *panel)
+{
+    struct generic_panel *ctx = panel_to_generic_panel(panel);
+    struct mipi_dsi_device *dsi = to_mipi_dsi_device(ctx->dev);
+    static const u8 display_on[] = { MIPI_DCS_SET_DISPLAY_ON };
+    int ret;
+
+    if (skip_init || ctx->display_on_sent)
+        return 0;
+
+    ret = mipi_dsi_dcs_write_buffer(dsi, display_on, sizeof(display_on));
+    if (ret < 0) {
+        dev_err(ctx->dev, "Failed to set display on: %d\n", ret);
+        return ret;
+    }
+
+    msleep(100);
+    return 0;
+}
+
+static const struct drm_panel_funcs generic_panel_funcs = {
+    .unprepare  = generic_panel_unprepare,
+    .prepare    = generic_panel_prepare,
+    .enable     = generic_panel_enable,
+    .get_modes  = generic_panel_get_modes,
+    .get_orientation = generic_panel_get_orientation,
+};
+
+static int generic_panel_probe(struct mipi_dsi_device *dsi)
+{
+    struct device *dev = &dsi->dev;
+    struct generic_panel *ctx;
+    int ret;
+
+    ctx = devm_drm_panel_alloc(dev, struct generic_panel, panel,
+                               &generic_panel_funcs, DRM_MODE_CONNECTOR_DSI);
+    if (IS_ERR(ctx))
+        return PTR_ERR(ctx);
+
+    ctx->enable_gpio = devm_gpiod_get_optional(dev, "enable", GPIOD_OUT_LOW);
+    if (IS_ERR(ctx->enable_gpio)) {
+        dev_err(dev, "cannot get enable gpio\n");
+	ctx->enable_gpio = NULL;
+    }
+
+    ctx->reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);
+    if (IS_ERR(ctx->reset_gpio)) {
+        dev_err(dev, "cannot get reset gpio\n");
+        return PTR_ERR(ctx->reset_gpio);
+    }
+
+    ctx->vdd = devm_regulator_get(dev, "vdd");
+    if (IS_ERR(ctx->vdd)) {
+        ret = PTR_ERR(ctx->vdd);
+        if (ret != -EPROBE_DEFER)
+            dev_err(dev, "Failed to request vdd regulator: %d\n", ret);
+        return ret;
+    }
+
+    ctx->iovcc = devm_regulator_get(dev, "iovcc");
+    if (IS_ERR(ctx->iovcc)) {
+        ret = PTR_ERR(ctx->iovcc);
+        if (ret != -EPROBE_DEFER)
+            dev_err(dev, "Failed to request iovcc regulator: %d\n", ret);
+        return ret;
+    }
+
+    ret = drm_of_get_panel_orientation(dev->of_node, &ctx->orientation);
+    if (ret < 0) {
+        dev_err(dev, "%pOF: failed to get orientation %d\n", dev->of_node, ret);
+        return ret;
+    }
+
+    mipi_dsi_set_drvdata(dsi, ctx);
+
+    ctx->dev = dev;
+
+    // Some defaults
+    dsi->lanes = 1;
+    dsi->format = MIPI_DSI_FMT_RGB888;
+    dsi->mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_BURST |
+              MIPI_DSI_MODE_LPM | MIPI_DSI_MODE_NO_EOT_PACKET |
+              MIPI_DSI_CLOCK_NON_CONTINUOUS;
+
+    ret = load_panel_description(dsi, ctx);
+    if (ret < 0) {
+        dev_err(dev, "Failed to load panel description\n");
+        return ret;
+    }
+
+    mipi_dsi_set_drvdata(dsi, ctx);
+
+    dev_info(dev, "lanes %d, format %d, mode %lx\n", dsi->lanes, dsi->format, dsi->mode_flags);
+
+    /*
+     * COLD-INIT EXPERIMENT (see WHAT-HAS-BEEN-TRIED.md "prepare_prev_first").
+     *
+     * The DRM bridge chain is encoder -> sprd_dsi.bridge -> panel_bridge(this).
+     * drm_atomic_bridge_chain_pre_enable() walks the chain in reverse, so by
+     * default THIS panel's prepare (which sends the 144-cmd init sequence) runs
+     * BEFORE sprd_dsi_bridge_pre_enable() has reset/initialised the DSI host or
+     * armed LP command mode -- and sprd_dsi then resets the controller, wiping
+     * whatever the panel just sent. That is the inverted ordering that makes
+     * cold kernel-native init fail while the U-Boot handoff path (which skips
+     * prepare entirely) works.
+     *
+     * Setting prepare_prev_first propagates to pre_enable_prev_first on the
+     * panel bridge (drm/bridge/panel.c), forcing sprd_dsi_bridge_pre_enable()
+     * to run FIRST: controller up + LP command mode armed, THEN this panel's
+     * init DCS -- matching the vendor U-Boot order (controller init, LP cmd
+     * enable, init cmds, video mode, hs clk). Only meaningful with
+     * handoff_skip_first_cycle = false.
+     */
+    ctx->panel.prepare_prev_first = true;
+
+    ret = drm_panel_of_backlight(&ctx->panel);
+    if (ret)
+        return ret;
+
+    if (dcs_backlight) {
+        struct backlight_properties props = {
+            .type = BACKLIGHT_RAW,
+            .max_brightness = 255,
+            .brightness = init_brightness ?
+                ((init_brightness * 0xff + 0x7ff) / 0xfff) : 0,
+        };
+        u32 def_level;
+
+        if (!of_property_read_u32(dev->of_node, "default-brightness-level", &def_level))
+            props.brightness = min_t(u32, def_level, 255);
+        if (props.brightness > 255)
+            props.brightness = 255;
+
+        ctx->bl = devm_backlight_device_register(dev, "panel_backlight", dev,
+                                                 ctx, &generic_panel_bl_ops, &props);
+        if (IS_ERR(ctx->bl)) {
+            dev_err(dev, "failed to register DCS backlight: %ld\n", PTR_ERR(ctx->bl));
+            ctx->bl = NULL;
+        } else {
+            dev_info(dev, "backlight registered: level %u (%u/4095)\n",
+                     props.brightness,
+                     ((props.brightness * 0xfff + 0x7f) / 0xff) & 0xfff);
+        }
+    }
+
+    drm_panel_add(&ctx->panel);
+
+    ret = mipi_dsi_attach(dsi);
+    if (ret < 0) {
+        dev_err(dev, "mipi_dsi_attach failed: %d\n", ret);
+        drm_panel_remove(&ctx->panel);
+        return ret;
+    }
+
+    return 0;
+}
+
+static void generic_panel_shutdown(struct mipi_dsi_device *dsi)
+{
+    struct generic_panel *ctx = mipi_dsi_get_drvdata(dsi);
+
+    drm_panel_unprepare(&ctx->panel);
+
+    drm_panel_disable(&ctx->panel);
+}
+
+static void generic_panel_remove(struct mipi_dsi_device *dsi)
+{
+    struct generic_panel *ctx = mipi_dsi_get_drvdata(dsi);
+    int ret;
+
+    generic_panel_shutdown(dsi);
+
+    ret = mipi_dsi_detach(dsi);
+    if (ret < 0)
+        dev_err(&dsi->dev, "Failed to detach from DSI host: %d\n", ret);
+
+    drm_panel_remove(&ctx->panel);
+}
+
+static const struct of_device_id generic_panel_of_match[] = {
+    { .compatible = "rocknix,generic-dsi" },
+    { /* sentinel */ }
+};
+MODULE_DEVICE_TABLE(of, generic_panel_of_match);
+
+static struct mipi_dsi_driver generic_panel_driver = {
+    .driver = {
+        .name = DRIVER_NAME,
+        .of_match_table = generic_panel_of_match,
+    },
+    .probe  = generic_panel_probe,
+    .remove = generic_panel_remove,
+    .shutdown = generic_panel_shutdown,
+};
+module_mipi_dsi_driver(generic_panel_driver);
+
+MODULE_AUTHOR("Danil Zagoskin <z@gosk.in>");
+MODULE_DESCRIPTION("DRM driver for generic MIPI DSI panel");
+MODULE_LICENSE("GPL v2");

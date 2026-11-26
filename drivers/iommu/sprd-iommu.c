@@ -13,6 +13,7 @@
 #include <linux/iommu.h>
 #include <linux/mfd/syscon.h>
 #include <linux/module.h>
+#include <linux/of_iommu.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
@@ -67,6 +68,8 @@ struct sprd_iommu_device {
 	enum sprd_iommu_version	ver;
 	u32			*prot_page_va;
 	dma_addr_t		prot_page_pa;
+	u32			iova_start;
+	u32			iova_end;
 	void __iomem		*base;
 	struct device		*dev;
 	struct iommu_device	iommu;
@@ -79,6 +82,7 @@ struct sprd_iommu_domain {
 	u32			*pgt_va; /* page table virtual address base */
 	dma_addr_t		pgt_pa; /* page table physical address base */
 	struct sprd_iommu_device	*sdev;
+	bool			attached;
 };
 
 static const struct iommu_ops sprd_iommu_ops;
@@ -110,6 +114,23 @@ sprd_iommu_update_bits(struct sprd_iommu_device *sdev, unsigned int reg,
 	sprd_iommu_write(sdev, reg, t);
 }
 
+/*
+ * Some IOMMUs (the display one on ums512) share an APB enable gate with
+ * their client. The gate stays prepared from probe on and is only enabled
+ * around register accesses, so it can drop while the client is off.
+ */
+static inline void sprd_iommu_eb_on(struct sprd_iommu_device *sdev)
+{
+	if (sdev->eb)
+		clk_enable(sdev->eb);
+}
+
+static inline void sprd_iommu_eb_off(struct sprd_iommu_device *sdev)
+{
+	if (sdev->eb)
+		clk_disable(sdev->eb);
+}
+
 static inline int
 sprd_iommu_get_version(struct sprd_iommu_device *sdev)
 {
@@ -133,9 +154,32 @@ sprd_iommu_pgt_size(struct iommu_domain *domain)
 		SPRD_IOMMU_PAGE_SHIFT) * sizeof(u32);
 }
 
+static int sprd_iommu_finalize_domain(struct sprd_iommu_domain *dom,
+				      struct sprd_iommu_device *sdev)
+{
+	size_t pgt_size;
+
+	dom->sdev = sdev;
+
+	dom->domain.pgsize_bitmap = SPRD_IOMMU_PAGE_SIZE;
+
+	dom->domain.geometry.aperture_start = sdev->iova_start;
+	dom->domain.geometry.aperture_end = sdev->iova_end;
+	dom->domain.geometry.force_aperture = true;
+
+	pgt_size = sprd_iommu_pgt_size(&dom->domain);
+	dom->pgt_va = dma_alloc_coherent(sdev->dev, pgt_size, &dom->pgt_pa,
+					 GFP_KERNEL);
+	if (!dom->pgt_va)
+		return -ENOMEM;
+
+	return 0;
+}
+
 static struct iommu_domain *sprd_iommu_domain_alloc_paging(struct device *dev)
 {
 	struct sprd_iommu_domain *dom;
+	int ret;
 
 	dom = kzalloc_obj(*dom);
 	if (!dom)
@@ -143,11 +187,15 @@ static struct iommu_domain *sprd_iommu_domain_alloc_paging(struct device *dev)
 
 	spin_lock_init(&dom->pgtlock);
 
-	dom->domain.pgsize_bitmap = SPRD_IOMMU_PAGE_SIZE;
+	if (dev) {
+		struct sprd_iommu_device *sdev = dev_iommu_priv_get(dev);
 
-	dom->domain.geometry.aperture_start = 0;
-	dom->domain.geometry.aperture_end = SZ_256M - 1;
-	dom->domain.geometry.force_aperture = true;
+		ret = sprd_iommu_finalize_domain(dom, sdev);
+		if (ret) {
+			kfree(dom);
+			return NULL;
+		}
+	}
 
 	return &dom->domain;
 }
@@ -226,23 +274,23 @@ static void sprd_iommu_hw_en(struct sprd_iommu_device *sdev, bool en)
 
 static void sprd_iommu_cleanup(struct sprd_iommu_domain *dom)
 {
-	size_t pgt_size;
-
 	/* Nothing need to do if the domain hasn't been attached */
-	if (!dom->sdev)
+	if (!dom->sdev || dom->sdev->dom != dom)
 		return;
 
-	pgt_size = sprd_iommu_pgt_size(&dom->domain);
-	dma_free_coherent(dom->sdev->dev, pgt_size, dom->pgt_va, dom->pgt_pa);
+	sprd_iommu_eb_on(dom->sdev);
 	sprd_iommu_hw_en(dom->sdev, false);
-	dom->sdev = NULL;
+	sprd_iommu_eb_off(dom->sdev);
+	dom->sdev->dom = NULL;
 }
 
 static void sprd_iommu_domain_free(struct iommu_domain *domain)
 {
 	struct sprd_iommu_domain *dom = to_sprd_domain(domain);
+	size_t pgt_size = sprd_iommu_pgt_size(domain);
 
 	sprd_iommu_cleanup(dom);
+	dma_free_coherent(dom->sdev->dev, pgt_size, dom->pgt_va, dom->pgt_pa);
 	kfree(dom);
 }
 
@@ -252,19 +300,16 @@ static int sprd_iommu_attach_device(struct iommu_domain *domain,
 {
 	struct sprd_iommu_device *sdev = dev_iommu_priv_get(dev);
 	struct sprd_iommu_domain *dom = to_sprd_domain(domain);
-	size_t pgt_size = sprd_iommu_pgt_size(domain);
+	int ret;
 
 	/* The device is attached to this domain */
 	if (sdev->dom == dom)
 		return 0;
 
-	/* The first time that domain is attaching to a device */
-	if (!dom->pgt_va) {
-		dom->pgt_va = dma_alloc_coherent(sdev->dev, pgt_size, &dom->pgt_pa, GFP_KERNEL);
-		if (!dom->pgt_va)
-			return -ENOMEM;
-
-		dom->sdev = sdev;
+	if (!dom->sdev) {
+		ret = sprd_iommu_finalize_domain(dom, sdev);
+		if (ret)
+			return ret;
 	}
 
 	sdev->dom = dom;
@@ -274,12 +319,14 @@ static int sprd_iommu_attach_device(struct iommu_domain *domain,
 	 * configure mapping table to avoid access conflict in case other
 	 * mapping table is stored in.
 	 */
+	sprd_iommu_eb_on(sdev);
 	sprd_iommu_hw_en(sdev, false);
 	sprd_iommu_first_ppn(dom);
 	sprd_iommu_first_vpn(dom);
 	sprd_iommu_vpn_range(dom);
 	sprd_iommu_default_ppn(sdev);
 	sprd_iommu_hw_en(sdev, true);
+	sprd_iommu_eb_off(sdev);
 
 	return 0;
 }
@@ -293,12 +340,12 @@ static int sprd_iommu_map(struct iommu_domain *domain, unsigned long iova,
 	unsigned long flags;
 	unsigned int i;
 	u32 *pgt_base_iova;
-	u32 pabase = (u32)paddr;
+	u32 ppage = (u32)(paddr >> SPRD_IOMMU_PAGE_SHIFT);
 	unsigned long start = domain->geometry.aperture_start;
 	unsigned long end = domain->geometry.aperture_end;
 
 	if (!dom->sdev) {
-		pr_err("No sprd_iommu_device attached to the domain\n");
+		pr_err("sprd_iommu_domain is not finalized!\n");
 		return -EINVAL;
 	}
 
@@ -312,8 +359,8 @@ static int sprd_iommu_map(struct iommu_domain *domain, unsigned long iova,
 
 	spin_lock_irqsave(&dom->pgtlock, flags);
 	for (i = 0; i < pgcount; i++) {
-		pgt_base_iova[i] = pabase >> SPRD_IOMMU_PAGE_SHIFT;
-		pabase += SPRD_IOMMU_PAGE_SIZE;
+		pgt_base_iova[i] = ppage;
+		ppage += 1;
 	}
 	spin_unlock_irqrestore(&dom->pgtlock, flags);
 
@@ -356,7 +403,9 @@ static int sprd_iommu_sync_map(struct iommu_domain *domain,
 		reg = SPRD_VAU_UPDATE;
 
 	/* clear IOMMU TLB buffer after page table updated */
+	sprd_iommu_eb_on(dom->sdev);
 	sprd_iommu_write(dom->sdev, reg, 0xffffffff);
+	sprd_iommu_eb_off(dom->sdev);
 	return 0;
 }
 
@@ -413,6 +462,7 @@ static const struct iommu_ops sprd_iommu_ops = {
 	.probe_device	= sprd_iommu_probe_device,
 	.device_group	= generic_single_device_group,
 	.of_xlate	= sprd_iommu_of_xlate,
+	.get_resv_regions = of_iommu_get_resv_regions,
 	.owner		= THIS_MODULE,
 	.default_domain_ops = &(const struct iommu_domain_ops) {
 		.attach_dev	= sprd_iommu_attach_device,
@@ -462,6 +512,7 @@ static int sprd_iommu_probe(struct platform_device *pdev)
 	struct sprd_iommu_device *sdev;
 	struct device *dev = &pdev->dev;
 	void __iomem *base;
+	u32 iova_range[2];
 	int ret;
 
 	sdev = devm_kzalloc(dev, sizeof(*sdev), GFP_KERNEL);
@@ -475,6 +526,24 @@ static int sprd_iommu_probe(struct platform_device *pdev)
 	}
 	sdev->base = base;
 
+	ret = of_property_read_u32_array(dev->of_node, "sprd,iova-range",
+					 iova_range, 2);
+	if (ret == -ENOENT) {
+		iova_range[0] = 0;
+		iova_range[1] = SZ_256M;
+	} else if (ret < 0) {
+		dev_err(dev, "Invalid sprd,iova-range property\n");
+		return PTR_ERR(base);
+	}
+
+	if (!IS_ALIGNED(iova_range[0], roundup_pow_of_two(iova_range[1]))) {
+		dev_err(dev, "Misaligned sprd,iova-range\n");
+		return PTR_ERR(base);
+	}
+
+	sdev->iova_start = iova_range[0];
+	sdev->iova_end = iova_range[0] + iova_range[1] - 1;
+
 	sdev->prot_page_va = dma_alloc_coherent(dev, SPRD_IOMMU_PAGE_SIZE,
 						&sdev->prot_page_pa, GFP_KERNEL);
 	if (!sdev->prot_page_va)
@@ -483,17 +552,9 @@ static int sprd_iommu_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, sdev);
 	sdev->dev = dev;
 
-	ret = iommu_device_sysfs_add(&sdev->iommu, dev, NULL, dev_name(dev));
-	if (ret)
-		goto free_page;
-
-	ret = iommu_device_register(&sdev->iommu, &sprd_iommu_ops, dev);
-	if (ret)
-		goto remove_sysfs;
-
 	ret = sprd_iommu_clk_enable(sdev);
 	if (ret)
-		goto unregister_iommu;
+		goto free_page;
 
 	ret = sprd_iommu_get_version(sdev);
 	if (ret < 0) {
@@ -502,18 +563,55 @@ static int sprd_iommu_probe(struct platform_device *pdev)
 	}
 	sdev->ver = ret;
 
+	ret = iommu_device_sysfs_add(&sdev->iommu, dev, NULL, dev_name(dev));
+	if (ret)
+		goto disable_clk;
+
+	ret = iommu_device_register(&sdev->iommu, &sprd_iommu_ops, dev);
+	if (ret)
+		goto remove_sysfs;
+
+	/* keep the gate prepared, enable it per access from here on */
+	sprd_iommu_eb_off(sdev);
+
 	return 0;
 
-disable_clk:
-	sprd_iommu_clk_disable(sdev);
-unregister_iommu:
-	iommu_device_unregister(&sdev->iommu);
 remove_sysfs:
 	iommu_device_sysfs_remove(&sdev->iommu);
+disable_clk:
+	sprd_iommu_clk_disable(sdev);
 free_page:
 	dma_free_coherent(sdev->dev, SPRD_IOMMU_PAGE_SIZE, sdev->prot_page_va, sdev->prot_page_pa);
 	return ret;
 }
+
+/*
+ * The IOMMU sits in a power domain that loses its registers when the SoC
+ * deep-sleeps (e.g. the display IOMMU inside the DPU block on ums512), while
+ * the page table lives in DDR and survives. Re-program the attached domain
+ * the way attach does, or the client fetches untranslated addresses.
+ */
+static int sprd_iommu_resume(struct device *dev)
+{
+	struct sprd_iommu_device *sdev = dev_get_drvdata(dev);
+	struct sprd_iommu_domain *dom = sdev->dom;
+
+	if (!dom)
+		return 0;
+
+	sprd_iommu_eb_on(sdev);
+	sprd_iommu_hw_en(sdev, false);
+	sprd_iommu_first_ppn(dom);
+	sprd_iommu_first_vpn(dom);
+	sprd_iommu_vpn_range(dom);
+	sprd_iommu_default_ppn(sdev);
+	sprd_iommu_hw_en(sdev, true);
+	sprd_iommu_eb_off(sdev);
+
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(sprd_iommu_pm_ops, NULL, sprd_iommu_resume);
 
 static void sprd_iommu_remove(struct platform_device *pdev)
 {
@@ -522,14 +620,15 @@ static void sprd_iommu_remove(struct platform_device *pdev)
 	dma_free_coherent(sdev->dev, SPRD_IOMMU_PAGE_SIZE, sdev->prot_page_va, sdev->prot_page_pa);
 
 	platform_set_drvdata(pdev, NULL);
-	iommu_device_sysfs_remove(&sdev->iommu);
 	iommu_device_unregister(&sdev->iommu);
+	iommu_device_sysfs_remove(&sdev->iommu);
 }
 
 static struct platform_driver sprd_iommu_driver = {
 	.driver	= {
 		.name		= "sprd-iommu",
 		.of_match_table	= sprd_iommu_of_match,
+		.pm		= pm_sleep_ptr(&sprd_iommu_pm_ops),
 		.suppress_bind_attrs = true,
 	},
 	.probe	= sprd_iommu_probe,

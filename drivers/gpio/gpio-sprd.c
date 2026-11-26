@@ -7,6 +7,7 @@
 #include <linux/bitops.h>
 #include <linux/gpio/driver.h>
 #include <linux/kernel.h>
+#include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/spinlock.h>
@@ -214,7 +215,15 @@ static const struct irq_chip sprd_gpio_irqchip = {
 	.irq_mask = sprd_gpio_irq_mask,
 	.irq_unmask = sprd_gpio_irq_unmask,
 	.irq_set_type = sprd_gpio_irq_set_type,
-	.flags = IRQCHIP_SKIP_SET_WAKE | IRQCHIP_IMMUTABLE,
+	/*
+	 * The GPIO block has no per-line wake enable: any unmasked line asserts
+	 * the shared parent interrupt and resumes the AP. MASK_ON_SUSPEND makes
+	 * genirq clear IE for every line that did not ask to be a wake source,
+	 * which is safe here because irq_mask() writes the register directly
+	 * instead of deferring to an irq bus lock.
+	 */
+	.flags = IRQCHIP_SKIP_SET_WAKE | IRQCHIP_MASK_ON_SUSPEND |
+		 IRQCHIP_IMMUTABLE,
 	GPIOCHIP_IRQ_RESOURCE_HELPERS,
 };
 
